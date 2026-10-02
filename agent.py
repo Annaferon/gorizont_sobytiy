@@ -19,6 +19,7 @@ TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_chann
 LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 CANDIDATES_PER_DAY = 3
+MAX_RETRIES = 3
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 STYLE_MODIFIERS = [
@@ -122,7 +123,6 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
 
 
 def call_llm(prompt):
-    """Запрос к LLM с принудительным JSON-режимом."""
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -146,7 +146,6 @@ def call_llm(prompt):
     if "choices" not in data:
         raise Exception(f"LLM error: {data}")
     content = data["choices"][0]["message"]["content"] or ""
-    print(f"[LLM RAW] {content[:300]}")
     return content.strip()
 
 
@@ -179,24 +178,48 @@ def parse_json(text):
 
 WRITER_PROMPT = """Напиши пост для Telegram-канала о космосе на тему: {topic}
 
-Формат ответа: только JSON-объект с тремя полями title, body, image_prompt. Без пояснений и без markdown.
+Ответ — только JSON-объект с тремя полями title, body, image_prompt. Без пояснений и без markdown.
 
-Поле title: заголовок, 5-9 слов, цепляющий.
-Поле body: текст поста на русском языке, 1800-2300 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
-Поле image_prompt: английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды. Без людей и животных.
+title — заголовок, 5-9 слов, цепляющий.
+body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
+image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды. Без людей и животных.
 """
 
 
 def validate(title, body, img):
     if not title or not body or not img:
         return False
-    if len(body.strip()) < 800:
+    blen = len(body.strip())
+    if blen < 1000 or blen > 3000:
         return False
     if len(title.strip()) < 8:
         return False
     if title.strip() in ("...", "…"):
         return False
     return True
+
+
+def generate_one(topic):
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            raw = call_llm(WRITER_PROMPT.format(topic=topic))
+            p = parse_json(raw)
+            title = (p.get("title") or "").strip()
+            body = (p.get("body") or "").strip()
+            img = (p.get("image_prompt") or "").strip()
+
+            if not validate(title, body, img):
+                print(f"[SKIP] attempt {attempt}: title={len(title)} body={len(body)} img={len(img)}")
+                print(f"       raw_tail={raw[-200:]}")
+                time.sleep(2)
+                continue
+
+            return title, body, img
+        except Exception as e:
+            print(f"[ERROR] attempt {attempt}: {e}")
+            time.sleep(2)
+
+    return None
 
 
 def task_write():
@@ -212,33 +235,26 @@ def task_write():
         conn.close()
         return
 
-    topic = random.choice(TOPICS)
-    print(f"[TOPIC] {topic}")
+    selected_topics = random.sample(TOPICS, CANDIDATES_PER_DAY)
+    print(f"[TOPICS] {selected_topics}")
     print(f"[MODEL] {LLM_MODEL}")
+
     created = []
+    for i, topic in enumerate(selected_topics, 1):
+        print(f"--- Generating {i}/{CANDIDATES_PER_DAY}: {topic} ---")
+        result = generate_one(topic)
+        if not result:
+            print(f"[FAILED] не удалось сгенерировать пост {i}")
+            continue
 
-    for i in range(CANDIDATES_PER_DAY):
-        try:
-            raw = call_llm(WRITER_PROMPT.format(topic=topic))
-            p = parse_json(raw)
-            title = (p.get("title") or "").strip()
-            body = (p.get("body") or "").strip()
-            img = (p.get("image_prompt") or "").strip()
-
-            if not validate(title, body, img):
-                print(f"[SKIP] {i+1}: title={len(title)} body={len(body)} img={len(img)}")
-                print(f"       raw_tail={raw[-200:]}")
-                continue
-
-            cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
-                           VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
-                        (topic, title, body, img))
-            did = cur.fetchone()["id"]
-            conn.commit()
-            created.append((did, title, body, img))
-            print(f"[OK] draft #{did}: {title} ({len(body)} znakov)")
-        except Exception as e:
-            print(f"[ERROR] {i+1}: {e}")
+        title, body, img = result
+        cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
+                       VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
+                    (topic, title, body, img))
+        did = cur.fetchone()["id"]
+        conn.commit()
+        created.append((did, title, body, img, topic))
+        print(f"[OK] draft #{did}: {title} ({len(body)} znakov)")
 
     cur.close()
     conn.close()
@@ -247,7 +263,7 @@ def task_write():
         send_tg(TG_ADMIN_ID, "⚠️ Writer ничего не сгенерил. Проверь лог.")
         return
 
-    for idx, (did, title, body, img) in enumerate(created, 1):
+    for idx, (did, title, body, img, topic) in enumerate(created, 1):
         kb = {"inline_keyboard": [[
             {"text": "✅ Опубликовать", "callback_data": f"ok:{did}"},
             {"text": "📁 Сохранить", "callback_data": f"save:{did}"},
@@ -259,7 +275,8 @@ def task_write():
         except Exception as e:
             print(f"[SEND ERROR] {idx}: {e}")
 
-    send_tg(TG_ADMIN_ID, f"📌 Тема дня: <b>{esc(topic)}</b>.")
+    topics_str = " · ".join(t[:40] for t in [c[4] for c in created])
+    send_tg(TG_ADMIN_ID, f"📌 Темы дня: <b>{esc(topics_str)}</b>")
 
 
 def task_publish():
@@ -398,8 +415,8 @@ def task_callbacks():
             print(f"edit error: {e}")
         processed += 1
 
-    cur.execute("""INSERT INTO bot_state (key, value, updated_at) VALUES ('tg_offset', %s, NOW())
-                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=NOW()""",
+    cur.execute("""INSERT INTO bot_state (key, value) VALUES ('tg_offset', %s)
+                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
                 (str(max_id + 1),))
     conn.commit()
     cur.close()
@@ -409,7 +426,7 @@ def task_callbacks():
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python agent.py [write|publish|stats|callbacks]")
+        print("Usage: python agent.py [write|publish|stats|callbacks|all]")
         sys.exit(1)
     t = sys.argv[1]
     if t == "write":
@@ -420,5 +437,8 @@ if __name__ == "__main__":
         task_stats()
     elif t == "callbacks":
         task_callbacks()
+    elif t == "all":
+        task_callbacks()
+        task_publish()
     else:
         print(f"Unknown: {t}")
