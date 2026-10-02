@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import html
 import random
 import requests
 import psycopg2
@@ -18,6 +19,19 @@ LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:fr
 
 CANDIDATES_PER_DAY = 3
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+STYLE_MODIFIERS = [
+    "with vibrant purple and blue nebula",
+    "with dramatic orange and gold lighting",
+    "with distant stars and galaxies",
+    "with a glowing accretion disk",
+    "with subtle teal and green tones",
+    "with harsh red light and shadows",
+    "with a soft cosmic glow",
+    "with swirling galactic dust",
+]
+
+COSMIC_PREFIX = "cosmic space scene, deep space, astronomy, nebula, stars, cinematic 4k, ultra detailed"
 
 TOPICS = [
     "Горизонт событий чёрной дыры: где заканчивается привычная физика",
@@ -49,7 +63,14 @@ def db():
 
 def tg(method, **kwargs):
     r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=30)
-    return r.json()
+    data = r.json()
+    if not data.get("ok"):
+        print(f"[TG ERROR] {method}: {data}")
+    return data
+
+
+def esc(text):
+    return html.escape(text or "", quote=False)
 
 
 def send_tg(chat_id, text, parse_mode="HTML", reply_markup=None):
@@ -67,23 +88,37 @@ def send_tg(chat_id, text, parse_mode="HTML", reply_markup=None):
                    "disable_web_page_preview": True}
         if reply_markup and i == len(chunks) - 1:
             payload["reply_markup"] = reply_markup
-        out.append(tg("sendMessage", **payload))
+        res = tg("sendMessage", **payload)
+        out.append(res)
         time.sleep(0.4)
     return out
 
 
-def pollinations_url(image_prompt):
-    return (
-        f"https://image.pollinations.ai/prompt/"
-        f"{quote(image_prompt)}?width=1024&height=1024&nologo=true&model=flux"
-    )
+def pollinations_url(image_prompt, seed):
+    base = f"https://image.pollinations.ai/prompt/{quote(image_prompt)}"
+    params = f"?width=1024&height=1024&nologo=true&model=flux&seed={seed}"
+    return base + params
 
 
-def send_photo_then_text(chat_id, image_prompt, full_text, reply_markup=None):
-    url = pollinations_url(image_prompt or "deep space cinematic cosmic scene, no text")
-    tg("sendPhoto", chat_id=chat_id, photo=url)
+def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
+    modifier = random.choice(STYLE_MODIFIERS)
+    seed = random.randint(1, 2_147_483_647)
+    enhanced_prompt = f"{COSMIC_PREFIX}, {image_prompt}, {modifier}"
+    url = pollinations_url(enhanced_prompt, seed)
+
+    print(f"[IMG] seed={seed}, prompt={enhanced_prompt[:120]}")
+    photo_res = tg("sendPhoto", chat_id=chat_id, photo=url)
+    if not photo_res.get("ok"):
+        # Фолбэк: пробуем без модели flux
+        url2 = url.replace("&model=flux", "")
+        print(f"[IMG] retry without flux: {url2[:120]}")
+        tg("sendPhoto", chat_id=chat_id, photo=url2)
     time.sleep(0.5)
-    send_tg(chat_id, full_text, reply_markup=reply_markup)
+
+    safe_title = esc(title)
+    safe_body = esc(body)
+    text = f"<b>{safe_title}</b>\n\n{safe_body}"
+    return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
 def call_llm(prompt):
@@ -93,7 +128,7 @@ def call_llm(prompt):
                  "Content-Type": "application/json"},
         json={"model": LLM_MODEL,
               "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.95, "max_tokens": 1800},
+              "temperature": 0.95, "max_tokens": 2200},
         timeout=240,
     )
     data = r.json()
@@ -120,27 +155,39 @@ def parse_json(text):
 
 WRITER_PROMPT = """Ты — автор научно-популярного Telegram-канала «Горизонт событий» о космосе, времени и физике в духе Стивена Хокинга.
 
-ЗАДАЧА: напиши один пост на заданную тему.
+ЗАДАЧА: напиши ОДИН пост на заданную тему. Это должен быть полноценный большой текст.
 
 ТЕМА: {topic}
 
-ТРЕБОВАНИЯ К ТЕКСТУ:
-- Язык строго русский. Только кириллица.
-- Увлекательно, но научно корректно. Как будто объясняешь другу, который умный, но не физик.
-- Длина тела поста 1800–2300 знаков (критично).
-- Разбей на 3–4 коротких абзаца, разделённых пустой строкой.
-- Обязательно 3–5 эмодзи по смыслу (не в каждом предложении).
-- В конце текста — 3 хештега: #космос #время #физика (или более подходящие по теме).
-- Не выдумывай факты. Если сомневаешься — используй известные теории.
-- Не используй HTML-теги и маркеры типа "ЗАГОЛОВОК:".
+ЖЁСТКИЕ ТРЕБОВАНИЯ:
+- Язык: строго русский. Только кириллица (латиница — только в общепринятых терминах).
+- Длина тела поста: РОВНО 1800–2300 знаков. Это критично. Короткий ответ не принимается.
+- Разбей текст на 3–4 абзаца, разделённых пустой строкой.
+- Обязательно 3–5 эмодзи по смыслу.
+- В САМОМ КОНЦЕ текста добавь 3 хештега: #космос #время #физика (или более подходящие).
+- Не используй HTML-теги, markdown-звёздочки и служебные метки.
+- НЕ пиши слов «ЗАГОЛОВОК:» или «ТЕКСТ:» внутри body.
 
-ЗАГОЛОВОК: 5–9 слов, цепляющий, интригующий. Без банальностей вроде «интересные факты о...».
+ЗАГОЛОВОК: 5–9 слов, цепляющий, интригующий. Не банальности.
 
-КАРТИНКА (image_prompt): промпт на английском, 10–18 слов. Опиши конкретную космическую сцену. Обязательно включи: deep space, cinematic, 4k, ultra detailed, no text, no people.
+КАРТИНКА (image_prompt): строго английский, 12–18 слов. Тема — КОСМОС: чёрные дыры, галактики, туманности, планеты, звёзды, космические явления. БЕЗ тигров, людей, животных, лесов, машин. Добавь: deep space, cinematic, 4k, ultra detailed, no text.
 
 ОТВЕТЬ СТРОГО JSON БЕЗ КОММЕНТАРИЕВ:
 {{"title": "...", "body": "...", "image_prompt": "..."}}
 """
+
+
+def validate(title, body, img):
+    """Базовая валидация контента."""
+    if not title or not body or not img:
+        return False
+    if len(body.strip()) < 500:
+        return False
+    if len(title.strip()) < 8:
+        return False
+    if title.strip() in ("...", "…"):
+        return False
+    return True
 
 
 def task_write():
@@ -157,26 +204,31 @@ def task_write():
         return
 
     topic = random.choice(TOPICS)
+    print(f"[TOPIC] {topic}")
     created = []
 
     for i in range(CANDIDATES_PER_DAY):
         try:
             raw = call_llm(WRITER_PROMPT.format(topic=topic))
             p = parse_json(raw)
-            title = p.get("title", "").strip()
-            body = p.get("body", "").strip()
-            img = p.get("image_prompt", "").strip()
-            if not (title and body and img):
-                print(f"Пост {i+1}: неполные поля, пропуск")
+            title = (p.get("title") or "").strip()
+            body = (p.get("body") or "").strip()
+            img = (p.get("image_prompt") or "").strip()
+
+            if not validate(title, body, img):
+                print(f"[SKIP] {i+1}: title={len(title)} body={len(body)} img={len(img)}")
+                print(f"       raw={raw[:200]}")
                 continue
+
             cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
                            VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
                         (topic, title, body, img))
             did = cur.fetchone()["id"]
             conn.commit()
             created.append((did, title, body, img))
+            print(f"[OK] draft #{did}: {title} ({len(body)} znakov)")
         except Exception as e:
-            print(f"Error {i+1}: {e}")
+            print(f"[ERROR] {i+1}: {e}")
 
     cur.close()
     conn.close()
@@ -186,18 +238,19 @@ def task_write():
         return
 
     for idx, (did, title, body, img) in enumerate(created, 1):
-        full_text = f"<b>Вариант {idx} из {len(created)}</b>\n\n<b>{title}</b>\n\n{body}"
+        full_text = f"<b>Вариант {idx} из {len(created)}</b>\n\n<b>{esc(title)}</b>\n\n{esc(body)}"
         kb = {"inline_keyboard": [[
             {"text": "✅ Опубликовать", "callback_data": f"ok:{did}"},
             {"text": "📁 Сохранить", "callback_data": f"save:{did}"},
             {"text": "❌ Удалить", "callback_data": f"no:{did}"},
         ]]}
         try:
-            send_photo_then_text(TG_ADMIN_ID, img, full_text, reply_markup=kb)
+            send_photo_then_text(TG_ADMIN_ID, img, title, body, reply_markup=kb)
+            print(f"[SENT] variant {idx} (draft #{did})")
         except Exception as e:
-            print(f"Send error {idx}: {e}")
+            print(f"[SEND ERROR] {idx}: {e}")
 
-    send_tg(TG_ADMIN_ID, f"📌 Тема дня: <b>{topic}</b>.")
+    send_tg(TG_ADMIN_ID, f"📌 Тема дня: <b>{esc(topic)}</b>.")
 
 
 def task_publish():
@@ -230,10 +283,9 @@ def task_publish():
         conn.close()
         return
 
-    img_prompt = d["image_prompt"] or "deep space cinematic cosmic scene, no text"
-    full_text = f"<b>{d['title']}</b>\n\n{d['content']}"
+    img_prompt = d["image_prompt"] or "cosmic deep space nebula stars"
     try:
-        send_photo_then_text(TG_CHANNEL_ID, img_prompt, full_text)
+        send_photo_then_text(TG_CHANNEL_ID, img_prompt, d["title"], d["content"])
     except Exception as e:
         print(f"Publish error: {e}")
         cur.close()
@@ -315,15 +367,15 @@ def task_callbacks():
                            (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
                         (d["title"], d["content"], d["image_prompt"]))
             cur.execute("UPDATE ai_drafts SET status='approved' WHERE id=%s", (did,))
-            new_text = f"<b>{d['title']}</b>\n\n{d['content']}\n\n✅ <i>В очереди на публикацию</i>"
+            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n✅ <i>В очереди на публикацию</i>"
             tg("answerCallbackQuery", callback_query_id=cb_id, text="✅ В очередь")
         elif action == "save":
             cur.execute("UPDATE ai_drafts SET status='saved' WHERE id=%s", (did,))
-            new_text = f"<b>{d['title']}</b>\n\n{d['content']}\n\n📁 <i>Сохранено в банк</i>"
+            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n📁 <i>Сохранено в банк</i>"
             tg("answerCallbackQuery", callback_query_id=cb_id, text="📁 Сохранено")
         elif action == "no":
             cur.execute("UPDATE ai_drafts SET status='rejected', rejected_at=NOW() WHERE id=%s", (did,))
-            new_text = f"<b>{d['title']}</b>\n\n{d['content']}\n\n❌ <i>Удалено</i>"
+            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n❌ <i>Удалено</i>"
             tg("answerCallbackQuery", callback_query_id=cb_id, text="❌ Удалено")
         else:
             continue
