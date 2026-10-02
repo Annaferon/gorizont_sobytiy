@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: 'write / publish / stats / callbacks'
+        description: 'write / publish / stats / callbacks / all'
         required: true
         default: 'write'
 
