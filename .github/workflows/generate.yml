@@ -1,4 +1,4 @@
-pyDaily Post Generation
+name: Daily Post Generation
 on:
   schedule:
     - cron: '0 5 * * *' # 05:00 UTC = 08:00 МСК
@@ -27,4 +27,4 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
-        run: python genegenerate
+        run: python generate.py
