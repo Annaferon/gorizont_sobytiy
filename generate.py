@@ -29,10 +29,10 @@ async def main():
     selected = random.sample(topics, 3)
 
     async with async_session() as session:
-        for topic in selected:
+        for i, topic in enumerate(selected, start=1):
             post_data = await generate_post(topic)
             post_hash = hashlib.md5(post_data["body"].encode()).hexdigest()
-            
+
             new_post = Post(
                 title=post_data["title"],
                 body=post_data["body"],
@@ -46,22 +46,37 @@ async def main():
             post_id = new_post.id
 
             kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish_{post_id}"),
-                 InlineKeyboardButton(text="💾 Сохранить", callback_data=f"save_{post_id}"),
-                 InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{post_id}")]
+                [InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"publish_{post_id}")],
+                [InlineKeyboardButton(text="💾 Сохранить", callback_data=f"save_{post_id}")],
+                [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{post_id}")]
             ])
-            
+
+            caption = (
+                f"📌 <b>Пост {i} из 3</b>\n\n"
+                f"<b>{post_data['title']}</b>\n\n"
+                f"{post_data['body']}"
+            )
+
             try:
-                await bot.send_photo(
-                    chat_id=admin_id,
-                    photo=post_data["image_url"],
-                    caption=f"<b>{post_data['title']}</b>\n\n{post_data['body'][:500]}...",
-                    parse_mode="HTML",
-                    reply_markup=kb
-                )
-                print(f"Пост на тему '{topic}' отправлен админу.")
+                if len(caption) <= 1024:
+                    await bot.send_photo(
+                        chat_id=admin_id,
+                        photo=post_data["image_url"],
+                        caption=caption,
+                        parse_mode="HTML",
+                        reply_markup=kb
+                    )
+                else:
+                    await bot.send_photo(chat_id=admin_id, photo=post_data["image_url"])
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=caption,
+                        parse_mode="HTML",
+                        reply_markup=kb
+                    )
+                print(f"Пост {i} (ID {post_id}) отправлен админу.")
             except Exception as e:
-                print(f"Ошибка отправки поста: {e}")
+                print(f"Ошибка отправки поста {i}: {e}")
 
     await bot.session.close()
     print("Генерация завершена.")
