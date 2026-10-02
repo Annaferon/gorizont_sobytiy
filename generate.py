@@ -4,10 +4,10 @@ import random
 import hashlib
 from dotenv import load_dotenv
 from aiogram import Bot
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from db.database import init_db, async_session
 from db.models import Post
-from services.generator import generate_post, sanitize_text
+from services.generator import generate_post, generate_image_url, download_image, sanitize_text
 
 load_dotenv()
 
@@ -38,7 +38,7 @@ async def main():
             new_post = Post(
                 title=post_data["title"],
                 body=post_data["body"],
-                image_url=None,  # не сохраняем картинку в БД
+                image_url=None,
                 status="draft",
                 hash=post_hash
             )
@@ -58,12 +58,20 @@ async def main():
             text_message = f"📌 <b>Пост {i} из 3</b>\n\n<b>{safe_title}</b>\n\n{safe_body}"
 
             try:
-                # Сначала картинка отдельным сообщением
-                await bot.send_photo(
-                    chat_id=admin_id,
-                    photo=post_data["image_url"]
-                )
-                # Потом текст с кнопками
+                # Скачиваем картинку сами
+                image_url = generate_image_url(post_data["title"])
+                print(f"Скачиваем картинку для поста {i}...")
+                image_bytes = await download_image(image_url)
+
+                if image_bytes:
+                    await bot.send_photo(
+                        chat_id=admin_id,
+                        photo=BufferedInputFile(image_bytes, filename=f"post_{post_id}.jpg")
+                    )
+                    print(f"Картинка поста {i} отправлена.")
+                else:
+                    print(f"Не удалось скачать картинку для поста {i}, отправляем без неё.")
+
                 await bot.send_message(
                     chat_id=admin_id,
                     text=text_message,
