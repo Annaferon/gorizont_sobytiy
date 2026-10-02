@@ -16,7 +16,7 @@ TG_BOT_TOKEN = os.environ["BOT_TOKEN"]
 TG_ADMIN_ID = int(os.environ["ADMIN_ID"])
 _raw_channel = os.environ["CHANNEL_ID"]
 TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_channel)
-LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
+LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 CANDIDATES_PER_DAY = 3
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
@@ -111,7 +111,7 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     photo_res = tg("sendPhoto", chat_id=chat_id, photo=url)
     if not photo_res.get("ok"):
         url2 = url.replace("&model=flux", "")
-        print(f"[IMG] retry without flux")
+        print("[IMG] retry without flux")
         tg("sendPhoto", chat_id=chat_id, photo=url2)
     time.sleep(0.5)
 
@@ -124,14 +124,20 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
 def call_llm(prompt):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
-                 "Content-Type": "application/json"},
-        json={"model": LLM_MODEL,
-              "messages": [
-                  {"role": "system", "content": "Ты выдаёшь только JSON без пояснений, размышлений и markdown."},
-                  {"role": "user", "content": prompt}
-              ],
-              "temperature": 0.9, "max_tokens": 2500},
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com",
+            "X-Title": "Gorizont Events",
+        },
+        json={
+            "model": LLM_MODEL,
+            "messages": [
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.95,
+            "max_tokens": 2200,
+        },
         timeout=240,
     )
     data = r.json()
@@ -143,11 +149,9 @@ def call_llm(prompt):
 
 
 def parse_json(text):
-    """Ищем JSON в любом месте ответа."""
     if not text:
         raise ValueError("empty response")
 
-    # Срезаем ```json ... ``` блоки
     if "```" in text:
         blocks = text.split("```")
         for b in blocks:
@@ -158,7 +162,6 @@ def parse_json(text):
                 text = b
                 break
 
-    # Ищем первую { и последнюю }
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -168,32 +171,29 @@ def parse_json(text):
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
-        # Убираем возможные trailing запятые и пробуем снова
         cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
         return json.loads(cleaned)
 
 
 WRITER_PROMPT = """Ты — автор научно-популярного Telegram-канала «Горизонт событий» о космосе, времени и физике в духе Стивена Хокинга.
 
-ЗАДАЧА: напиши ОДИН пост на заданную тему и верни результат строго в JSON.
+Напиши пост на тему: {topic}
 
-ТЕМА: {topic}
+Требования:
+1. Язык строго русский. Только кириллица.
+2. Длина тела поста 1800–2300 знаков.
+3. Стиль: увлекательно, но научно корректно. Как будто объясняешь другу, который умный, но не физик.
+4. Разбей на 3–4 коротких абзаца, разделённых пустой строкой.
+5. 3–5 эмодзи по смыслу (не в каждом предложении).
+6. В конце текста — 3 хештега: #космос #время #физика.
+7. Не выдумывай факты, используй известные теории.
+8. Не используй HTML-теги и markdown.
 
-ЖЁСТКИЕ ТРЕБОВАНИЯ:
-- Язык: строго русский. Только кириллица (латиница — только в общепринятых терминах).
-- Длина тела поста: РОВНО 1800–2300 знаков. Это критично.
-- Разбей текст на 3–4 абзаца, разделённых пустой строкой.
-- Обязательно 3–5 эмодзи по смыслу.
-- В САМОМ КОНЦЕ текста добавь 3 хештега: #космос #время #физика.
-- Не используй HTML-теги и markdown-звёздочки.
+Заголовок: 5–9 слов, цепляющий, интригующий. Без банальностей вроде «интересные факты о...».
 
-ЗАГОЛОВОК: 5–9 слов, цепляющий.
+image_prompt: промпт для картинки на английском, 12–18 слов. Тема — космос: чёрные дыры, галактики, туманности, планеты, звёзды. Без людей и животных. Добавь: deep space, cinematic, 4k, no text.
 
-КАРТИНКА (image_prompt): строго английский, 12–18 слов. Тема — КОСМОС: чёрные дыры, галактики, туманности, планеты, звёзды. БЕЗ людей, животных, лесов. Добавь: deep space, cinematic, 4k, no text.
-
-ВАЖНО: НЕ пиши размышлений, объяснений, преамбул. Сразу выдай JSON.
-
-ФОРМАТ ОТВЕТА (только это, без markdown):
+Ответь строго JSON без комментариев и размышлений:
 {{"title": "...", "body": "...", "image_prompt": "..."}}
 """
 
@@ -259,7 +259,6 @@ def task_write():
         return
 
     for idx, (did, title, body, img) in enumerate(created, 1):
-        full_text = f"<b>Вариант {idx} из {len(created)}</b>\n\n<b>{esc(title)}</b>\n\n{esc(body)}"
         kb = {"inline_keyboard": [[
             {"text": "✅ Опубликовать", "callback_data": f"ok:{did}"},
             {"text": "📁 Сохранить", "callback_data": f"save:{did}"},
