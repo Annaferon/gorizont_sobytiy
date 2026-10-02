@@ -3,10 +3,11 @@ import os
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from aiogram import Bot
+from aiogram.types import BufferedInputFile
 from sqlalchemy import select
 from db.database import async_session
 from db.models import Post, Queue, BotState
-from services.generator import generate_image_url, sanitize_text
+from services.generator import generate_image_url, download_image, sanitize_text
 
 load_dotenv()
 
@@ -103,7 +104,6 @@ async def process_callbacks(bot: Bot):
                 except Exception:
                     pass
                 try:
-                    # Удалить и картинку — она шла отдельным сообщением выше
                     await bot.delete_message(chat_id=admin_id, message_id=cb.message.message_id - 1)
                 except Exception:
                     pass
@@ -124,10 +124,17 @@ async def publish_queue(bot: Bot):
             post = await session.get(Post, item.post_id)
             if post and post.status == "saved":
                 try:
-                    # Картинка генерируется заново из заголовка
                     image_url = generate_image_url(post.title)
+                    print(f"Скачиваем картинку для публикации: {post.title}")
+                    image_bytes = await download_image(image_url)
 
-                    await bot.send_photo(chat_id=channel_id, photo=image_url)
+                    if image_bytes:
+                        await bot.send_photo(
+                            chat_id=channel_id,
+                            photo=BufferedInputFile(image_bytes, filename=f"post_{post.id}.jpg")
+                        )
+                    else:
+                        print(f"Картинка для {post.id} не скачалась, публикуем без неё.")
 
                     safe_title = sanitize_text(post.title)
                     safe_body = sanitize_text(post.body)
