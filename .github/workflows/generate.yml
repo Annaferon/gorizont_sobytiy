@@ -1,8 +1,8 @@
-name: Daily Post Generation
+pyDaily Post Generation
 on:
   schedule:
-    - cron: '0 5 * * *' # Запуск каждый день в 05:00 UTC (08:00 по Москве)
-  workflow_dispatch: # Позволяет запустить вручную для теста
+    - cron: '0 5 * * *' # 05:00 UTC = 08:00 МСК
+  workflow_dispatch:
 
 jobs:
   generate:
@@ -25,6 +25,6 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GIGACHAT_CLIENT_ID: ${{ secrets.GIGACHAT_CLIENT_ID }}
-          GIGACHAT_CLIENT_SECRET: ${{ secrets.GIGACHAT_CLIENT_SECRET }}
-        run: python generate.py
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        run: python genegenerate
