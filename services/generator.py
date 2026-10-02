@@ -1,12 +1,13 @@
 import os
 import re
 import html
+import asyncio
 import urllib.parse
 import hashlib
 import random as rnd
+import aiohttp
 from openai import OpenAI
 
-# Разнообразные стили для картинок
 STYLES = [
     "realistic NASA photography, Hubble telescope style",
     "digital art, cinematic sci-fi",
@@ -22,7 +23,6 @@ STYLES = [
     "matte painting, epic scale",
 ]
 
-# Разнообразные сюжеты
 SUBJECTS = [
     "black hole accretion disk",
     "spiral galaxy with bright core",
@@ -41,7 +41,6 @@ SUBJECTS = [
 ]
 
 def generate_image_url(seed_text: str) -> str:
-    """Детерминированно генерирует URL картинки на основе seed_text (заголовка)."""
     seed = int(hashlib.md5(seed_text.encode("utf-8")).hexdigest(), 16) % (2**32)
     rng = rnd.Random(seed)
     style = rng.choice(STYLES)
@@ -53,8 +52,26 @@ def generate_image_url(seed_text: str) -> str:
         f"?width=1024&height=1024&nologo=true&seed={seed}"
     )
 
+async def download_image(url: str, retries: int = 4, timeout: int = 60) -> bytes | None:
+    """Скачивает картинку с ретраями. Pollinations иногда отвечает медленно."""
+    for attempt in range(retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        if data and len(data) > 1000:
+                            return data
+        except Exception as e:
+            print(f"Попытка {attempt + 1} скачать картинку не удалась: {e}")
+        await asyncio.sleep(3)
+    return None
+
 def sanitize_text(text: str) -> str:
-    """Убираем любые HTML-теги и экранируем спецсимволы для Telegram."""
     text = re.sub(r"<[^>]*>", "", text)
     return html.escape(text)
 
@@ -123,7 +140,4 @@ async def generate_post(topic: str) -> dict:
     if not title:
         title = f"Загадка Вселенной: {topic[:60]}"
 
-    # Картинка генерируется из заголовка — не сохраняем в БД
-    image_url = generate_image_url(title)
-
-    return {"title": title, "body": body, "image_url": image_url}
+    return {"title": title, "body": body}
