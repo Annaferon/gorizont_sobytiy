@@ -7,7 +7,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from db.database import init_db, async_session
 from db.models import Post
-from services.generator import generate_post
+from services.generator import generate_post, sanitize_text
 
 load_dotenv()
 
@@ -24,19 +24,21 @@ async def main():
         "Тёмная материя: невидимый каркас мироздания",
         "Парадокс Ферми: почему мы одни во Вселенной",
         "Телепортация: как это работает в реальности",
-        "Смерть Вселенной: как всё закончится"
+        "Смерть Вселенной: как всё закончится",
+        "Мультивселенная: сколько реальностей существует одновременно",
+        "Замедление времени: как гравитация растягивает секунды",
     ]
     selected = random.sample(topics, 3)
 
     async with async_session() as session:
         for i, topic in enumerate(selected, start=1):
             post_data = await generate_post(topic)
-            post_hash = hashlib.md5(post_data["body"].encode()).hexdigest()
+            post_hash = hashlib.md5(post_data["body"].encode("utf-8")).hexdigest()
 
             new_post = Post(
                 title=post_data["title"],
                 body=post_data["body"],
-                image_url=post_data["image_url"],
+                image_url=None,  # не сохраняем картинку в БД
                 status="draft",
                 hash=post_hash
             )
@@ -51,29 +53,23 @@ async def main():
                 [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{post_id}")]
             ])
 
-            caption = (
-                f"📌 <b>Пост {i} из 3</b>\n\n"
-                f"<b>{post_data['title']}</b>\n\n"
-                f"{post_data['body']}"
-            )
+            safe_title = sanitize_text(post_data["title"])
+            safe_body = sanitize_text(post_data["body"])
+            text_message = f"📌 <b>Пост {i} из 3</b>\n\n<b>{safe_title}</b>\n\n{safe_body}"
 
             try:
-                if len(caption) <= 1024:
-                    await bot.send_photo(
-                        chat_id=admin_id,
-                        photo=post_data["image_url"],
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=kb
-                    )
-                else:
-                    await bot.send_photo(chat_id=admin_id, photo=post_data["image_url"])
-                    await bot.send_message(
-                        chat_id=admin_id,
-                        text=caption,
-                        parse_mode="HTML",
-                        reply_markup=kb
-                    )
+                # Сначала картинка отдельным сообщением
+                await bot.send_photo(
+                    chat_id=admin_id,
+                    photo=post_data["image_url"]
+                )
+                # Потом текст с кнопками
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=text_message,
+                    parse_mode="HTML",
+                    reply_markup=kb
+                )
                 print(f"Пост {i} (ID {post_id}) отправлен админу.")
             except Exception as e:
                 print(f"Ошибка отправки поста {i}: {e}")
