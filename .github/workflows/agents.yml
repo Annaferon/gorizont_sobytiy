@@ -1,0 +1,44 @@
+name: agents
+
+on:
+  schedule:
+    # МСК = UTC+3
+    - cron: '0 2 * * *'      # 05:00 МСК — генерация 3 черновиков
+    - cron: '0 18 * * *'     # 21:00 МСК — статистика
+    - cron: '*/15 * * * *'   # каждые 15 минут — кнопки + публикация
+  workflow_dispatch:
+    inputs:
+      task:
+        description: 'write / publish / stats / callbacks'
+        required: true
+        default: 'write'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Run task
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          ADMIN_ID: ${{ secrets.ADMIN_ID }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
+        run: |
+          CRON="${{ github.event.schedule }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            python agent.py ${{ github.event.inputs.task }}
+          elif [ "$CRON" = "0 2 * * *" ]; then
+            python agent.py write
+          elif [ "$CRON" = "0 18 * * *" ]; then
+            python agent.py stats
+          elif [ "$CRON" = "*/15 * * * *" ]; then
+            python agent.py callbacks
+            python agent.py publish
+          fi
