@@ -4,6 +4,7 @@ import json
 import time
 import html
 import random
+import re
 import requests
 import psycopg2
 from urllib.parse import quote
@@ -15,7 +16,7 @@ TG_BOT_TOKEN = os.environ["BOT_TOKEN"]
 TG_ADMIN_ID = int(os.environ["ADMIN_ID"])
 _raw_channel = os.environ["CHANNEL_ID"]
 TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_channel)
-LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
 
 CANDIDATES_PER_DAY = 3
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
@@ -109,9 +110,8 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     print(f"[IMG] seed={seed}, prompt={enhanced_prompt[:120]}")
     photo_res = tg("sendPhoto", chat_id=chat_id, photo=url)
     if not photo_res.get("ok"):
-        # Фолбэк: пробуем без модели flux
         url2 = url.replace("&model=flux", "")
-        print(f"[IMG] retry without flux: {url2[:120]}")
+        print(f"[IMG] retry without flux")
         tg("sendPhoto", chat_id=chat_id, photo=url2)
     time.sleep(0.5)
 
@@ -127,61 +127,81 @@ def call_llm(prompt):
         headers={"Authorization": f"Bearer {OPENROUTER_KEY}",
                  "Content-Type": "application/json"},
         json={"model": LLM_MODEL,
-              "messages": [{"role": "user", "content": prompt}],
-              "temperature": 0.95, "max_tokens": 2200},
+              "messages": [
+                  {"role": "system", "content": "Ты выдаёшь только JSON без пояснений, размышлений и markdown."},
+                  {"role": "user", "content": prompt}
+              ],
+              "temperature": 0.9, "max_tokens": 2500},
         timeout=240,
     )
     data = r.json()
     if "choices" not in data:
         raise Exception(f"LLM error: {data}")
-    return data["choices"][0]["message"]["content"].strip()
+    content = data["choices"][0]["message"]["content"] or ""
+    print(f"[LLM RAW] {content[:300]}")
+    return content.strip()
 
 
 def parse_json(text):
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
+    """Ищем JSON в любом месте ответа."""
+    if not text:
+        raise ValueError("empty response")
+
+    # Срезаем ```json ... ``` блоки
+    if "```" in text:
+        blocks = text.split("```")
+        for b in blocks:
+            b = b.strip()
+            if b.startswith("json"):
+                b = b[4:].strip()
+            if b.startswith("{"):
+                text = b
+                break
+
+    # Ищем первую { и последнюю }
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"no JSON object in response: {text[:200]}")
+
+    candidate = text[start:end + 1]
     try:
-        return json.loads(text)
-    except Exception:
-        import re
-        m = re.search(r'\{.*\}', text, re.DOTALL)
-        if m:
-            return json.loads(m.group())
-        raise
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        # Убираем возможные trailing запятые и пробуем снова
+        cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
+        return json.loads(cleaned)
 
 
 WRITER_PROMPT = """Ты — автор научно-популярного Telegram-канала «Горизонт событий» о космосе, времени и физике в духе Стивена Хокинга.
 
-ЗАДАЧА: напиши ОДИН пост на заданную тему. Это должен быть полноценный большой текст.
+ЗАДАЧА: напиши ОДИН пост на заданную тему и верни результат строго в JSON.
 
 ТЕМА: {topic}
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 - Язык: строго русский. Только кириллица (латиница — только в общепринятых терминах).
-- Длина тела поста: РОВНО 1800–2300 знаков. Это критично. Короткий ответ не принимается.
+- Длина тела поста: РОВНО 1800–2300 знаков. Это критично.
 - Разбей текст на 3–4 абзаца, разделённых пустой строкой.
 - Обязательно 3–5 эмодзи по смыслу.
-- В САМОМ КОНЦЕ текста добавь 3 хештега: #космос #время #физика (или более подходящие).
-- Не используй HTML-теги, markdown-звёздочки и служебные метки.
-- НЕ пиши слов «ЗАГОЛОВОК:» или «ТЕКСТ:» внутри body.
+- В САМОМ КОНЦЕ текста добавь 3 хештега: #космос #время #физика.
+- Не используй HTML-теги и markdown-звёздочки.
 
-ЗАГОЛОВОК: 5–9 слов, цепляющий, интригующий. Не банальности.
+ЗАГОЛОВОК: 5–9 слов, цепляющий.
 
-КАРТИНКА (image_prompt): строго английский, 12–18 слов. Тема — КОСМОС: чёрные дыры, галактики, туманности, планеты, звёзды, космические явления. БЕЗ тигров, людей, животных, лесов, машин. Добавь: deep space, cinematic, 4k, ultra detailed, no text.
+КАРТИНКА (image_prompt): строго английский, 12–18 слов. Тема — КОСМОС: чёрные дыры, галактики, туманности, планеты, звёзды. БЕЗ людей, животных, лесов. Добавь: deep space, cinematic, 4k, no text.
 
-ОТВЕТЬ СТРОГО JSON БЕЗ КОММЕНТАРИЕВ:
+ВАЖНО: НЕ пиши размышлений, объяснений, преамбул. Сразу выдай JSON.
+
+ФОРМАТ ОТВЕТА (только это, без markdown):
 {{"title": "...", "body": "...", "image_prompt": "..."}}
 """
 
 
 def validate(title, body, img):
-    """Базовая валидация контента."""
     if not title or not body or not img:
         return False
-    if len(body.strip()) < 500:
+    if len(body.strip()) < 800:
         return False
     if len(title.strip()) < 8:
         return False
@@ -205,6 +225,7 @@ def task_write():
 
     topic = random.choice(TOPICS)
     print(f"[TOPIC] {topic}")
+    print(f"[MODEL] {LLM_MODEL}")
     created = []
 
     for i in range(CANDIDATES_PER_DAY):
@@ -217,7 +238,7 @@ def task_write():
 
             if not validate(title, body, img):
                 print(f"[SKIP] {i+1}: title={len(title)} body={len(body)} img={len(img)}")
-                print(f"       raw={raw[:200]}")
+                print(f"       raw_tail={raw[-200:]}")
                 continue
 
             cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
