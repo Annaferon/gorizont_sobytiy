@@ -6,8 +6,21 @@ from db.models import Base
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL").replace("postgresql://", "postgresql+asyncpg://")
-engine = create_async_engine(DATABASE_URL, echo=False)
+raw_url = os.getenv("DATABASE_URL", "").strip()
+
+# Приводим к формату asyncpg
+url = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+# Отрезаем query-параметры (asyncpg их не понимает в URL)
+if "?" in url:
+    url = url.split("?", 1)[0]
+
+engine = create_async_engine(
+    url,
+    echo=False,
+    pool_pre_ping=True,
+    connect_args={"ssl": "require"},
+)
 async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 async def init_db():
