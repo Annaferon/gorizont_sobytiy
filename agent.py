@@ -19,7 +19,7 @@ TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_chann
 LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
 CANDIDATES_PER_DAY = 3
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 STYLE_MODIFIERS = [
@@ -122,7 +122,7 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
-def call_llm(prompt):
+def call_llm(prompt, temperature=0.9):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -133,10 +133,8 @@ def call_llm(prompt):
         },
         json={
             "model": LLM_MODEL,
-            "messages": [
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.9,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": temperature,
             "max_tokens": 2200,
             "response_format": {"type": "json_object"},
         },
@@ -145,14 +143,12 @@ def call_llm(prompt):
     data = r.json()
     if "choices" not in data:
         raise Exception(f"LLM error: {data}")
-    content = data["choices"][0]["message"]["content"] or ""
-    return content.strip()
+    return (data["choices"][0]["message"]["content"] or "").strip()
 
 
 def parse_json(text):
     if not text:
         raise ValueError("empty response")
-
     if "```" in text:
         blocks = text.split("```")
         for b in blocks:
@@ -162,18 +158,27 @@ def parse_json(text):
             if b.startswith("{"):
                 text = b
                 break
-
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
-        raise ValueError(f"no JSON object in response: {text[:200]}")
-
+        raise ValueError(f"no JSON object: {text[:200]}")
     candidate = text[start:end + 1]
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
         return json.loads(cleaned)
+
+
+def find_mixed_scripts(text):
+    """Находит слова, в которых смешаны кириллица и латиница."""
+    bad = []
+    for word in re.findall(r"[А-Яа-яA-Za-z]+", text):
+        has_cyr = any("\u0400" <= c <= "\u04FF" for c in word)
+        has_lat = any(("a" <= c.lower() <= "z") for c in word)
+        if has_cyr and has_lat:
+            bad.append(word)
+    return bad
 
 
 WRITER_PROMPT = """Напиши пост для Telegram-канала о космосе на тему: {topic}
@@ -183,37 +188,52 @@ WRITER_PROMPT = """Напиши пост для Telegram-канала о кос�
 title — заголовок, 5-9 слов, цепляющий.
 body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
 image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды. Без людей и животных.
+
+КРИТИЧНО: русские слова пиши только кириллицей. НЕ смешивай латиницу и кириллицу в одном слове (нельзя "реlict", нужно "реликтовой"). Английские термины (WIMP, NASA) пиши полностью латиницей. Проверь текст на орфографию перед отправкой.
 """
 
 
 def validate(title, body, img):
     if not title or not body or not img:
-        return False
+        return False, "пустые поля"
     blen = len(body.strip())
-    if blen < 1000 or blen > 3000:
-        return False
+    if blen < 1000:
+        return False, f"body короткий ({blen})"
+    if blen > 3000:
+        return False, f"body длинный ({blen})"
     if len(title.strip()) < 8:
-        return False
+        return False, "заголовок короткий"
     if title.strip() in ("...", "…"):
-        return False
-    return True
+        return False, "заголовок-заглушка"
+
+    mixed_title = find_mixed_scripts(title)
+    mixed_body = find_mixed_scripts(body)
+    if mixed_title or mixed_body:
+        bad = (mixed_title + mixed_body)[:5]
+        return False, f"смешанные алфавиты: {bad}"
+
+    return True, "ok"
 
 
 def generate_one(topic):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            raw = call_llm(WRITER_PROMPT.format(topic=topic))
+            # Чуть меняем температуру, чтобы получить другой результат при повторной попытке
+            temp = 0.9 if attempt == 1 else 1.0
+            raw = call_llm(WRITER_PROMPT.format(topic=topic), temperature=temp)
             p = parse_json(raw)
             title = (p.get("title") or "").strip()
             body = (p.get("body") or "").strip()
             img = (p.get("image_prompt") or "").strip()
 
-            if not validate(title, body, img):
-                print(f"[SKIP] attempt {attempt}: title={len(title)} body={len(body)} img={len(img)}")
-                print(f"       raw_tail={raw[-200:]}")
+            ok, reason = validate(title, body, img)
+            if not ok:
+                print(f"[SKIP] attempt {attempt}: {reason}")
+                print(f"       body_preview={body[:150]}")
                 time.sleep(2)
                 continue
 
+            print(f"[OK] attempt {attempt}: body={len(body)} znakov")
             return title, body, img
         except Exception as e:
             print(f"[ERROR] attempt {attempt}: {e}")
@@ -254,7 +274,7 @@ def task_write():
         did = cur.fetchone()["id"]
         conn.commit()
         created.append((did, title, body, img, topic))
-        print(f"[OK] draft #{did}: {title} ({len(body)} znakov)")
+        print(f"[OK] draft #{did}: {title}")
 
     cur.close()
     conn.close()
