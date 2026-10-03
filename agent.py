@@ -71,7 +71,9 @@ TOPICS = [
 ]
 
 
+# ---- Расширенная автозамена ----
 AUTO_FIXES = [
+    # Аббревиатуры и термины
     (r"\bСЗИ\b", "СМВ"),
     (r"\bСМБ\b", "СМВ"),
     (r"\bАЛС\b", "БАС"),
@@ -87,6 +89,22 @@ AUTO_FIXES = [
     (r"\bНаш наблюдаемый Вселенная\b", "Наша наблюдаемая Вселенная"),
     (r"\bнамеками\b", "намёками"),
     (r"\bНамеками\b", "Намёками"),
+    # Новые ошибки из последнего прогона
+    (r"\bгуголь\b", "гугол"),
+    (r"\bГуголь\b", "Гугол"),
+    (r"\bгуголь\b", "гугол"),
+    (r"термодинамическ\w+ стрелок", "термодинамическая стрела"),
+    (r"термодинамическ\w+ стрелк\w+", "термодинамическая стрела"),
+    (r"газировк\w+ хронологии", "защита хронологии"),
+    (r"газировк\w+ времени", "защита хронологии"),
+    (r"\bкосмоческ\w+", "космического"),
+    (r"\bКосмоческ\w+", "Космического"),
+    (r"генеральн\w+ теори\w+ относительности", "Общая теория относительности"),
+    (r"Генеральн\w+ теори\w+ относительности", "Общая теория относительности"),
+    (r"звездную эру", "звёздную эру"),
+    (r"звездной эры", "звёздной эры"),
+    (r"звездную эпоху", "звёздную эпоху"),
+    (r"\bзвездн\w+", "звёздн"),
 ]
 
 
@@ -152,13 +170,21 @@ SUSPICIOUS_PATTERNS = [
     (r"наш наблюдаемый Вселенная", "согласование рода"),
     (r"Наш наблюдаемый Вселенная", "согласование рода"),
     (r"намеками", "намёками — потеряна ё"),
+    (r"гуголь", "гуголь вместо гугол"),
+    (r"гуголь", "гуголь вместо гугол"),
+    (r"термодинамическ\w+ стрелок", "стрелок вместо стрела"),
+    (r"термодинамическ\w+ стрелк", "стрелка вместо стрела"),
+    (r"газировк\w+ хронологии", "газировка вместо защита"),
+    (r"космоческ", "космоческого вместо космического"),
+    (r"генеральн\w+ теори", "генеральная вместо Общая"),
+    (r"звездн", "звездн вместо звёздн"),
 ]
 
 
 def find_suspicious(text):
     found = []
     for pattern, label in SUSPICIOUS_PATTERNS:
-        if re.search(pattern, text or ""):
+        if re.search(pattern, text or "", re.IGNORECASE):
             found.append(label)
     return found
 
@@ -227,12 +253,10 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
 
 
 def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=True):
-    """Запрос к LLM. use_prefill=True заставляет модель продолжить JSON, а не размышлять."""
     target_model = model or LLM_MODEL
 
     messages = [{"role": "user", "content": prompt}]
     if use_prefill:
-        # Начинаем ответ ассистента с открывающей скобки — модель будет продолжать JSON
         messages.append({"role": "assistant", "content": '{"title": "'})
 
     body = {
@@ -259,7 +283,6 @@ def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=T
     if "choices" not in data:
         raise Exception(f"LLM error: {data}")
     content = (data["choices"][0]["message"]["content"] or "").strip()
-    # Возвращаем prefill к результату, если он был отрезан
     if use_prefill and not content.startswith("{"):
         content = '{"title": "' + content
     return content
@@ -268,7 +291,6 @@ def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=T
 def parse_json(text):
     if not text:
         raise ValueError("empty response")
-    # Ищем первый { и последний }
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -302,22 +324,41 @@ title — заголовок, 5-9 слов, цепляющий.
 body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца, между ними пустые строки. 3-5 эмодзи. В конце хештеги #космос #время #физика.
 image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды.
 
+ВАЖНЫЕ ТЕРМИНЫ (проверь, что ты пишешь их правильно):
+- «Общая теория относительности» (НЕ «генеральная»)
+- «гугол» (НЕ «гуголь»)
+- «термодинамическая стрела времени» (НЕ «стрелок»)
+- «защита хронологии» (гипотеза Хокинга, НЕ «газировка»)
+- «космический» (НЕ «космоческий»)
+- «реликтовое излучение» или «СМВ» (НЕ «СМБ», «СЗИ»)
+- «боковой амиотрофический склероз» или «БАС» (НЕ «АЛС»)
+
 Пиши только кириллицей, без латиницы в русских словах. Проверь орфографию.
 """
 
 
-PROOFREAD_PROMPT = """Ты — строгий корректор русского научно-популярного текста.
+PROOFREAD_PROMPT = """Ты — строгий корректор русского научно-популярного текста о космосе.
 
-Исправь в этом JSON ошибки:
+Исправь в этом JSON все ошибки:
 
 {json_text}
 
 {extra_note}
 
-ЧЕК-ЛИСТ:
+ОБЯЗАТЕЛЬНЫЙ ЧЕК-ЛИСТ:
 1. Согласование рода/числа/падежа: «наш наблюдаемый Вселенная» → «наша наблюдаемая Вселенная», «Оккама бритвой» → «бритвы Оккама».
-2. Термины: СЗИ/СМБ → СМВ; АЛС → БАС; «частицовый» → «частичный»; «замерлите» → «замрёте»; «пузырёвый» → «пузырьковый».
-3. Орфография: ставь ё (намёками, звёзды, замёрз).
+2. Термины:
+   - СЗИ/СМБ → СМВ (реликтовое излучение)
+   - АЛС → БАС (боковой амиотрофический склероз)
+   - «частицовый» → «частичный»
+   - «замерлите» → «замрёте»
+   - «пузырёвый» → «пузырьковый»
+   - «гуголь» → «гугол»
+   - «термодинамический стрелок» → «термодинамическая стрела времени»
+   - «газировка хронологии» → «защита хронологии»
+   - «космоческий» → «космический»
+   - «генеральная теория относительности» → «Общая теория относительности»
+3. Орфография: ставь ё (намёками, звёзды, замёрз, звёздную).
 4. Смешение алфавитов: «реlict» → «реликтовый».
 5. Естественный порядок слов — если фраза звучит как машинный перевод, перестрой.
 6. Длина body 1500-2000 знаков: если короче — расширь, если длиннее — сократи.
@@ -357,7 +398,6 @@ def validate(title, body, img):
 
 
 def proofread(title, body, img, model=None):
-    """Вычитка через LLM. Возвращает (title, body, img, applied)."""
     payload = {"title": title, "body": body, "image_prompt": img}
     json_text = json.dumps(payload, ensure_ascii=False)
 
@@ -367,7 +407,7 @@ def proofread(title, body, img, model=None):
             suspicious = find_suspicious(current[0] + " " + current[1])
             extra_note = ""
             if suspicious:
-                extra_note = "ОСОБОЕ ВНИМАНИЕ: " + "; ".join(suspicious)
+                extra_note = "ОСОБОЕ ВНИМАНИЕ (найдены автоматически): " + "; ".join(suspicious)
 
             raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text, extra_note=extra_note),
                            temperature=0.2, max_tokens=3000,
@@ -394,7 +434,6 @@ def proofread(title, body, img, model=None):
 
 
 def try_generate(topic, model, use_prefill, attempts):
-    """Пробует сгенерировать пост с указанной моделью."""
     for attempt in range(1, attempts + 1):
         try:
             temp = 0.9 if attempt == 1 else 1.0
@@ -423,17 +462,14 @@ def try_generate(topic, model, use_prefill, attempts):
 
 
 def generate_one(topic):
-    # Сначала основная модель с prefill
     result = try_generate(topic, LLM_MODEL, use_prefill=True, attempts=MAX_RETRIES)
     if not result:
-        # Fallback: другая модель без prefill, с response_format
         print(f"[FALLBACK] переключаемся на {FALLBACK_MODEL}")
         result = try_generate(topic, FALLBACK_MODEL, use_prefill=False, attempts=2)
     if not result:
         return None
 
     title, body, img = result
-    # Вычитка
     title_pr, body_pr, img_pr, applied = proofread(title, body, img)
     body_pr = auto_fix(body_pr)
     title_pr = auto_fix(title_pr)
