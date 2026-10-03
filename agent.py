@@ -18,9 +18,10 @@ TG_ADMIN_ID = int(os.environ["ADMIN_ID"])
 _raw_channel = os.environ["CHANNEL_ID"]
 TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_channel)
 LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen/qwen-2.5-72b-instruct:free")
 
 CANDIDATES_PER_DAY = 5
-MAX_RETRIES = 4
+MAX_RETRIES = 3
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 STYLE_MODIFIERS = [
@@ -70,9 +71,7 @@ TOPICS = [
 ]
 
 
-# ---- Автозамена частых ошибок ----
 AUTO_FIXES = [
-    # (паттерн, замена)
     (r"\bСЗИ\b", "СМВ"),
     (r"\bСМБ\b", "СМВ"),
     (r"\bАЛС\b", "БАС"),
@@ -88,7 +87,6 @@ AUTO_FIXES = [
     (r"\bНаш наблюдаемый Вселенная\b", "Наша наблюдаемая Вселенная"),
     (r"\bнамеками\b", "намёками"),
     (r"\bНамеками\b", "Намёками"),
-    (r"\bзвёзд\b", "звёзд"),  # защитная, ничего не меняет
 ]
 
 
@@ -103,7 +101,6 @@ def auto_fix(text):
     return text
 
 
-# ---- Проверка символов ----
 def is_allowed_char(ch):
     if ch in "\n\r\t ":
         return True
@@ -166,7 +163,6 @@ def find_suspicious(text):
     return found
 
 
-# ---- Работа с БД и Telegram ----
 def db():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -230,7 +226,24 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
-def call_llm(prompt, temperature=0.9, max_tokens=3000):
+def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=True):
+    """Запрос к LLM. use_prefill=True заставляет модель продолжить JSON, а не размышлять."""
+    target_model = model or LLM_MODEL
+
+    messages = [{"role": "user", "content": prompt}]
+    if use_prefill:
+        # Начинаем ответ ассистента с открывающей скобки — модель будет продолжать JSON
+        messages.append({"role": "assistant", "content": '{"title": "'})
+
+    body = {
+        "model": target_model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if not use_prefill:
+        body["response_format"] = {"type": "json_object"}
+
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -239,33 +252,23 @@ def call_llm(prompt, temperature=0.9, max_tokens=3000):
             "HTTP-Referer": "https://github.com",
             "X-Title": "Gorizont Events",
         },
-        json={
-            "model": LLM_MODEL,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-            "response_format": {"type": "json_object"},
-        },
+        json=body,
         timeout=240,
     )
     data = r.json()
     if "choices" not in data:
         raise Exception(f"LLM error: {data}")
-    return (data["choices"][0]["message"]["content"] or "").strip()
+    content = (data["choices"][0]["message"]["content"] or "").strip()
+    # Возвращаем prefill к результату, если он был отрезан
+    if use_prefill and not content.startswith("{"):
+        content = '{"title": "' + content
+    return content
 
 
 def parse_json(text):
     if not text:
         raise ValueError("empty response")
-    if "```" in text:
-        blocks = text.split("```")
-        for b in blocks:
-            b = b.strip()
-            if b.startswith("json"):
-                b = b[4:].strip()
-            if b.startswith("{"):
-                text = b
-                break
+    # Ищем первый { и последний }
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -275,7 +278,10 @@ def parse_json(text):
         result = json.loads(candidate)
     except json.JSONDecodeError:
         cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
-        result = json.loads(cleaned)
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"invalid JSON: {e}: {candidate[:200]}")
 
     if isinstance(result, dict) and len(result) == 1:
         only_val = list(result.values())[0]
@@ -288,72 +294,37 @@ def parse_json(text):
     return result
 
 
-WRITER_PROMPT = """Напиши пост для Telegram-канала о космосе на тему: {topic}
+WRITER_PROMPT = """Ты — автор научно-популярного Telegram-канала о космосе. Напиши пост на тему: {topic}
 
-ВАЖНО: начни свой ответ ровно с символа {{ и не пиши никаких размышлений, пояснений или преамбул. Только JSON.
-
-Формат JSON:
-{{"title": "...", "body": "...", "image_prompt": "..."}}
+Формат ответа: JSON-объект с полями title, body, image_prompt.
 
 title — заголовок, 5-9 слов, цепляющий.
-body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
+body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца, между ними пустые строки. 3-5 эмодзи. В конце хештеги #космос #время #физика.
 image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды.
 
-КРИТИЧНО:
-- Только кириллица в русских словах. Не смешивай с латиницей.
-- Английские термины (WIMP, NASA) — отдельными словами.
-- Проверь орфографию.
+Пиши только кириллицей, без латиницы в русских словах. Проверь орфографию.
 """
 
-PROOFREAD_PROMPT = """Ты — строгий корректор русского научно-популярного текста. Получаешь JSON с полями title, body, image_prompt.
 
-Вход:
+PROOFREAD_PROMPT = """Ты — строгий корректор русского научно-популярного текста.
+
+Исправь в этом JSON ошибки:
+
 {json_text}
 
 {extra_note}
 
-ЗАДАЧА: верни исправленный JSON с теми же тремя полями. Никаких пояснений, начни ответ ровно с {{.
+ЧЕК-ЛИСТ:
+1. Согласование рода/числа/падежа: «наш наблюдаемый Вселенная» → «наша наблюдаемая Вселенная», «Оккама бритвой» → «бритвы Оккама».
+2. Термины: СЗИ/СМБ → СМВ; АЛС → БАС; «частицовый» → «частичный»; «замерлите» → «замрёте»; «пузырёвый» → «пузырьковый».
+3. Орфография: ставь ё (намёками, звёзды, замёрз).
+4. Смешение алфавитов: «реlict» → «реликтовый».
+5. Естественный порядок слов — если фраза звучит как машинный перевод, перестрой.
+6. Длина body 1500-2000 знаков: если короче — расширь, если длиннее — сократи.
 
-ОБЯЗАТЕЛЬНЫЙ ЧЕК-ЛИСТ (проверь каждое):
+НЕ меняй: image_prompt (если там нет ошибок), смысл, хештеги.
 
-1. СОГЛАСОВАНИЕ РОДА/ЧИСЛА/ПАДЕЖА:
-   - «наш наблюдаемый Вселенная» → «наша наблюдаемая Вселенная»
-   - «Оккама бритвой» / «бритвой Оккама» → «бритвы Оккама»
-   - Проверь все существительные с прилагательными и местоимениями.
-
-2. ФАКТИЧЕСКИЕ ТЕРМИНЫ:
-   - СЗИ, СМБ → СМВ (среднее микроволновое / реликтовое излучение)
-   - АЛС → БАС (боковой амиотрофический склероз)
-   - «частицовый» → «частичный»
-   - «замерлите» → «замрёте»
-   - «пузырёвый» / «пузырёвых» → «пузырьковый» / «пузырьковых»
-
-3. ОРФОГРАФИЯ И Ё:
-   - «намеками» → «намёками», «звезды» → «звёзды», «замерз» → «замёрз»
-   - Ставь ё везде, где это литературная норма.
-
-4. СМЕШЕНИЕ АЛФАВИТОВ:
-   - «реlict» → «реликтовый»
-   - Убери любые не-русские символы, кроме общепринятых аббревиатур (NASA, WIMP, СМВ).
-
-5. ЕСТЕСТВЕННОСТЬ ПОРЯДКА СЛОВ:
-   - Если фраза звучит как машинный перевод — перестрой.
-   - Пример плохо: «нарушающей принцип Оккама бритвой» → хорошо: «нарушающей принцип бритвы Оккама».
-
-6. ДЛИНА BODY:
-   - Должно быть 1500–2000 знаков. Если короче 1500 — расширь, сохранив смысл. Если длиннее 2200 — сократи.
-
-НЕ МЕНЯЙ:
-- image_prompt (только если там ошибки английского)
-- Общий смысл
-- Хештеги в конце
-
-Пример до/после:
-До: "Наш наблюдаемый Вселенная — лишь островок. Критики называют мультивселенную метафизикой, нарушающей принцип Оккама бритвой. Пузырёвые вселенные рождаются вечно."
-После: "Наша наблюдаемая Вселенная — лишь островок. Критики называют мультивселенную метафизикой, нарушающей принцип бритвы Оккама. Пузырьковые вселенные рождаются вечно."
-
-Формат ответа:
-{{"title": "...", "body": "...", "image_prompt": "..."}}
+Верни JSON с теми же тремя полями: title, body, image_prompt.
 """
 
 
@@ -385,8 +356,8 @@ def validate(title, body, img):
     return True, "ok"
 
 
-def proofread(title, body, img):
-    """Вычитка через LLM с чек-листом. Возвращает (title, body, img, applied)."""
+def proofread(title, body, img, model=None):
+    """Вычитка через LLM. Возвращает (title, body, img, applied)."""
     payload = {"title": title, "body": body, "image_prompt": img}
     json_text = json.dumps(payload, ensure_ascii=False)
 
@@ -396,10 +367,11 @@ def proofread(title, body, img):
             suspicious = find_suspicious(current[0] + " " + current[1])
             extra_note = ""
             if suspicious:
-                extra_note = "ОСОБОЕ ВНИМАНИЕ (проблемы, найденные автоматически): " + "; ".join(suspicious)
+                extra_note = "ОСОБОЕ ВНИМАНИЕ: " + "; ".join(suspicious)
 
             raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text, extra_note=extra_note),
-                           temperature=0.2, max_tokens=3000)
+                           temperature=0.2, max_tokens=3000,
+                           model=model, use_prefill=False)
             p = parse_json(raw)
             t2 = (p.get("title") or "").strip()
             b2 = (p.get("body") or "").strip()
@@ -410,61 +382,67 @@ def proofread(title, body, img):
 
             remaining = find_suspicious(t2 + " " + b2)
             if not remaining:
-                print("[PROOFREAD] чисто, ошибок не найдено")
+                print("[PROOFREAD] чисто")
                 return current + (True,)
-            else:
-                print(f"[PROOFREAD] остались проблемы: {remaining}, повторный проход")
-                json_text = json.dumps({"title": t2, "body": b2, "image_prompt": i2}, ensure_ascii=False)
+            print(f"[PROOFREAD] остались: {remaining}, повтор")
+            json_text = json.dumps({"title": t2, "body": b2, "image_prompt": i2}, ensure_ascii=False)
         except Exception as e:
-            print(f"[PROOFREAD ERROR] попытка {attempt}: {e}")
+            print(f"[PROOFREAD ERROR] {attempt}: {e}")
             time.sleep(1)
 
     return current + (True,)
 
 
-def generate_one(topic):
-    for attempt in range(1, MAX_RETRIES + 1):
+def try_generate(topic, model, use_prefill, attempts):
+    """Пробует сгенерировать пост с указанной моделью."""
+    for attempt in range(1, attempts + 1):
         try:
             temp = 0.9 if attempt == 1 else 1.0
-            raw = call_llm(WRITER_PROMPT.format(topic=topic), temperature=temp)
+            raw = call_llm(WRITER_PROMPT.format(topic=topic),
+                           temperature=temp, model=model, use_prefill=use_prefill)
             p = parse_json(raw)
             title = (p.get("title") or "").strip()
             body = (p.get("body") or "").strip()
             img = (p.get("image_prompt") or "").strip()
 
-            # Автозамена известных ошибок
             title = auto_fix(title)
             body = auto_fix(body)
 
             ok, reason = validate(title, body, img)
             if not ok:
-                print(f"[SKIP] attempt {attempt}: {reason}")
-                print(f"       body_preview={body[:150]}")
-                time.sleep(2)
+                print(f"[SKIP] {model.split('/')[-1]} #{attempt}: {reason}")
+                time.sleep(1)
                 continue
 
-            print(f"[GENERATED] attempt {attempt}: body={len(body)} znakov")
-            title_pr, body_pr, img_pr, applied = proofread(title, body, img)
-
-            if applied:
-                body_pr = auto_fix(body_pr)
-                title_pr = auto_fix(title_pr)
-                ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
-                if ok_pr:
-                    print(f"[OK] после вычитки: body={len(body_pr)} znakov")
-                    return title_pr, body_pr, img_pr
-                else:
-                    print(f"[PROOFREAD REJECTED] {reason_pr} — берём оригинал")
-            else:
-                print("[PROOFREAD SKIPPED] берём оригинал")
-
+            print(f"[GENERATED] {model.split('/')[-1]} #{attempt}: body={len(body)}")
             return title, body, img
-
         except Exception as e:
-            print(f"[ERROR] attempt {attempt}: {e}")
-            time.sleep(2)
-
+            print(f"[ERROR] {model.split('/')[-1]} #{attempt}: {str(e)[:200]}")
+            time.sleep(1)
     return None
+
+
+def generate_one(topic):
+    # Сначала основная модель с prefill
+    result = try_generate(topic, LLM_MODEL, use_prefill=True, attempts=MAX_RETRIES)
+    if not result:
+        # Fallback: другая модель без prefill, с response_format
+        print(f"[FALLBACK] переключаемся на {FALLBACK_MODEL}")
+        result = try_generate(topic, FALLBACK_MODEL, use_prefill=False, attempts=2)
+    if not result:
+        return None
+
+    title, body, img = result
+    # Вычитка
+    title_pr, body_pr, img_pr, applied = proofread(title, body, img)
+    body_pr = auto_fix(body_pr)
+    title_pr = auto_fix(title_pr)
+    ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
+    if ok_pr:
+        print(f"[OK] после вычитки: body={len(body_pr)}")
+        return title_pr, body_pr, img_pr
+    print(f"[REJECT PROOFREAD] {reason_pr} — берём оригинал")
+    return title, body, img
 
 
 def task_write():
@@ -483,6 +461,7 @@ def task_write():
     selected_topics = random.sample(TOPICS, CANDIDATES_PER_DAY)
     print(f"[TOPICS] {selected_topics}")
     print(f"[MODEL] {LLM_MODEL}")
+    print(f"[FALLBACK] {FALLBACK_MODEL}")
 
     created = []
     failed_topics = []
