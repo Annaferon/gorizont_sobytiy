@@ -23,8 +23,10 @@ FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen/qwen-2.5-72b-instruct:fr
 CANDIDATES_PER_DAY = 5
 MAX_RETRIES = 3
 
-# Защита от двойного запуска в течение часа (ретраи GitHub и т.п.)
-# Расписание публикаций задаётся в .github/workflows/agents.yml
+# Автоудаление старых pending-черновиков (часов)
+PENDING_TTL_HOURS = 48
+
+# Защита от двойного запуска публикации в течение часа
 SAFETY_MIN_INTERVAL_MINUTES = 60
 
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
@@ -477,19 +479,27 @@ def generate_one(topic):
     return title, body, img
 
 
+def cleanup_old_pending(cur):
+    """Удаляет pending-посты старше PENDING_TTL_HOURS часов."""
+    cur.execute(f"""DELETE FROM ai_drafts
+                    WHERE status='pending'
+                    AND created_at < NOW() - INTERVAL '{PENDING_TTL_HOURS} hours'
+                    RETURNING id""")
+    deleted = cur.fetchall()
+    if deleted:
+        print(f"[CLEANUP] удалено {len(deleted)} старых pending (>{PENDING_TTL_HOURS}ч)")
+    return len(deleted)
+
+
 def task_write():
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    cur.execute("""SELECT COUNT(*) AS c FROM ai_drafts
-                   WHERE created_at > NOW() - INTERVAL '24 hours'
-                   AND status='pending'""")
-    if cur.fetchone()["c"] > 0:
-        print("Свежие черновики уже есть — пропуск")
-        cur.close()
-        conn.close()
-        return
+    # Шаг 1: чистим старые pending (>48 часов), чтобы база не забивалась
+    cleanup_old_pending(cur)
+    conn.commit()
 
+    # Шаг 2: генерируем 5 свежих постов (блокировки по свежим pending больше НЕТ)
     selected_topics = random.sample(TOPICS, CANDIDATES_PER_DAY)
     print(f"[TOPICS] {selected_topics}")
     print(f"[MODEL] {LLM_MODEL}")
@@ -506,13 +516,17 @@ def task_write():
             continue
 
         title, body, img = result
-        cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
-                       VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
-                    (topic, title, body, img))
-        did = cur.fetchone()["id"]
-        conn.commit()
-        created.append((did, title, body, img, topic))
-        print(f"[OK] draft #{did}: {title}")
+        try:
+            cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
+                           VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
+                        (topic, title, body, img))
+            did = cur.fetchone()["id"]
+            conn.commit()
+            created.append((did, title, body, img, topic))
+            print(f"[OK] draft #{did}: {title}")
+        except psycopg2.errors.UniqueViolation:
+            conn.rollback()
+            print(f"[SKIP] дубликат (hash уже есть в базе)")
 
     cur.close()
     conn.close()
@@ -534,7 +548,7 @@ def task_write():
             print(f"[SEND ERROR] {idx}: {e}")
 
     topics_str = " · ".join(t[:40] for t in [c[4] for c in created])
-    send_tg(TG_ADMIN_ID, f"📌 Темы дня ({len(created)}): <b>{esc(topics_str)}</b>")
+    send_tg(TG_ADMIN_ID, f"📌 Новые посты ({len(created)}): <b>{esc(topics_str)}</b>")
 
     if failed_topics:
         failed_str = " · ".join(t[:40] for t in failed_topics)
@@ -565,7 +579,6 @@ def task_publish():
         conn.close()
         return
 
-    # Защита от случайного двойного запуска в течение часа
     cur.execute(f"""SELECT 1 FROM publish_queue
                     WHERE published_at > NOW() - INTERVAL '{SAFETY_MIN_INTERVAL_MINUTES} minutes'
                     LIMIT 1""")
@@ -575,7 +588,6 @@ def task_publish():
         conn.close()
         return
 
-    # Сначала берём из очереди (то, что ты нажал ✅)
     cur.execute("""SELECT * FROM publish_queue WHERE published_at IS NULL
                    ORDER BY position NULLS LAST, id LIMIT 1""")
     d = cur.fetchone()
@@ -589,7 +601,6 @@ def task_publish():
         conn.close()
         return
 
-    # Очередь пуста — берём случайный из банка
     cur.execute("""SELECT * FROM ai_drafts
                    WHERE status='saved'
                    ORDER BY RANDOM() LIMIT 1""")
@@ -641,7 +652,7 @@ def task_stats():
            f"Публикация: <b>{enabled}</b>\n\n"
            f"📅 Расписание (МСК):\n"
            f"04:00 — генерация 5 постов\n"
-           f"08:00 — обработка нажатий\n"
+           f"каждые 2 ч — обработка нажатий\n"
            f"10:00 — публикация №1\n"
            f"15:00 — публикация №2\n"
            f"21:00 — сводка")
