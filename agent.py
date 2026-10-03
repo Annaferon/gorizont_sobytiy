@@ -59,6 +59,60 @@ TOPICS = [
 ]
 
 
+# --- Разрешённые символы ---
+def _build_allowed_set():
+    allowed = set()
+    # Кириллица
+    for c in range(0x0400, 0x0500):
+        allowed.add(chr(c))
+    # Латиница (для терминов WIMP, NASA и т.п.)
+    for c in range(ord('a'), ord('z') + 1):
+        allowed.add(chr(c))
+    for c in range(ord('A'), ord('Z') + 1):
+        allowed.add(chr(c))
+    # Цифры
+    for c in range(ord('0'), ord('9') + 1):
+        allowed.add(chr(c))
+    # Пунктуация и пробелы
+    for ch in " \t\n\r.,!?;:—–-\"'«»""''()[]/\\*#@&%+=<>§|~^$°":
+        allowed.add(ch)
+    # Эмодзи (основные диапазоны)
+    for start, end in [
+        (0x2600, 0x27BF),     # Misc symbols & dingbats
+        (0x2B00, 0x2BFF),     # Misc symbols and arrows
+        (0x1F000, 0x1FAFF),   # Основной эмодзи-блок
+    ]:
+        for c in range(start, end + 1):
+            allowed.add(chr(c))
+    # Спец-символы для эмодзи
+    allowed.add('\u200d')   # ZWJ
+    allowed.add('\uFE0F')   # Variation selector
+    return allowed
+
+
+ALLOWED_CHARS = _build_allowed_set()
+
+
+def find_bad_chars(text):
+    """Возвращает список недопустимых символов (корейский, арабский, иероглифы и т.п.)"""
+    bad = []
+    for ch in text:
+        if ch not in ALLOWED_CHARS:
+            bad.append(ch)
+    return bad
+
+
+def find_mixed_scripts(text):
+    """Находит слова, где смешаны кириллица и латиница."""
+    bad = []
+    for word in re.findall(r"[А-Яа-яЁёA-Za-z]+", text):
+        has_cyr = any("\u0400" <= c <= "\u04FF" for c in word)
+        has_lat = any(("a" <= c.lower() <= "z") for c in word)
+        if has_cyr and has_lat:
+            bad.append(word)
+    return bad
+
+
 def db():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -122,7 +176,7 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
-def call_llm(prompt, temperature=0.9):
+def call_llm(prompt, temperature=0.9, max_tokens=2200):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -135,7 +189,7 @@ def call_llm(prompt, temperature=0.9):
             "model": LLM_MODEL,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "max_tokens": 2200,
+            "max_tokens": max_tokens,
             "response_format": {"type": "json_object"},
         },
         timeout=240,
@@ -170,17 +224,6 @@ def parse_json(text):
         return json.loads(cleaned)
 
 
-def find_mixed_scripts(text):
-    """Находит слова, в которых смешаны кириллица и латиница."""
-    bad = []
-    for word in re.findall(r"[А-Яа-яA-Za-z]+", text):
-        has_cyr = any("\u0400" <= c <= "\u04FF" for c in word)
-        has_lat = any(("a" <= c.lower() <= "z") for c in word)
-        if has_cyr and has_lat:
-            bad.append(word)
-    return bad
-
-
 WRITER_PROMPT = """Напиши пост для Telegram-канала о космосе на тему: {topic}
 
 Ответ — только JSON-объект с тремя полями title, body, image_prompt. Без пояснений и без markdown.
@@ -189,7 +232,28 @@ title — заголовок, 5-9 слов, цепляющий.
 body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
 image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды. Без людей и животных.
 
-КРИТИЧНО: русские слова пиши только кириллицей. НЕ смешивай латиницу и кириллицу в одном слове (нельзя "реlict", нужно "реликтовой"). Английские термины (WIMP, NASA) пиши полностью латиницей. Проверь текст на орфографию перед отправкой.
+КРИТИЧНО:
+- Пиши только на русском языке кириллицей. Не используй буквы других алфавитов.
+- Не смешивай кириллицу и латиницу в одном слове.
+- Английские термины (WIMP, NASA) — только отдельными словами латиницей.
+- Проверь текст на орфографию перед отправкой.
+"""
+
+PROOFREAD_PROMPT = """Проверь следующий JSON для Telegram-поста и исправь ошибки.
+
+Входной JSON:
+{json_text}
+
+Правила:
+- Исправь орфографические, грамматические, пунктуационные и фактические ошибки.
+- Исправь неправильные термины (например, СМБ → СМВ, АЛС → БАС, «Частицовый» → «Частичный»).
+- Убери любые символы не русского алфавита, кроме цифр, эмодзи и общепринятых аббревиатур латиницей (WIMP, NASA и т.п.).
+- Сохрани смысл, стиль, длину (1500-2000 знаков) и эмодзи.
+- Не добавляй пояснений и markdown.
+- Если ошибок нет — верни JSON без изменений.
+
+Верни только исправленный JSON в том же формате:
+{{"title": "...", "body": "...", "image_prompt": "..."}}
 """
 
 
@@ -206,6 +270,12 @@ def validate(title, body, img):
     if title.strip() in ("...", "…"):
         return False, "заголовок-заглушка"
 
+    bad_title = find_bad_chars(title)
+    bad_body = find_bad_chars(body)
+    if bad_title or bad_body:
+        bad = (bad_title + bad_body)[:5]
+        return False, f"посторонние символы: {bad}"
+
     mixed_title = find_mixed_scripts(title)
     mixed_body = find_mixed_scripts(body)
     if mixed_title or mixed_body:
@@ -215,10 +285,28 @@ def validate(title, body, img):
     return True, "ok"
 
 
+def proofread(title, body, img):
+    """Второй проход через LLM для вычитки. Возвращает исправленные поля."""
+    payload = {"title": title, "body": body, "image_prompt": img}
+    json_text = json.dumps(payload, ensure_ascii=False)
+    try:
+        raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text),
+                       temperature=0.2, max_tokens=2200)
+        p = parse_json(raw)
+        title2 = (p.get("title") or "").strip()
+        body2 = (p.get("body") or "").strip()
+        img2 = (p.get("image_prompt") or "").strip()
+        if not (title2 and body2 and img2):
+            return title, body, img
+        return title2, body2, img2
+    except Exception as e:
+        print(f"[PROOFREAD ERROR] {e}")
+        return title, body, img
+
+
 def generate_one(topic):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            # Чуть меняем температуру, чтобы получить другой результат при повторной попытке
             temp = 0.9 if attempt == 1 else 1.0
             raw = call_llm(WRITER_PROMPT.format(topic=topic), temperature=temp)
             p = parse_json(raw)
@@ -233,8 +321,20 @@ def generate_one(topic):
                 time.sleep(2)
                 continue
 
-            print(f"[OK] attempt {attempt}: body={len(body)} znakov")
-            return title, body, img
+            # Второй проход — вычитка
+            print(f"[PROOFREAD] attempt {attempt}: исправляем ошибки...")
+            title_pr, body_pr, img_pr = proofread(title, body, img)
+
+            # Валидируем результат вычитки
+            ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
+            if ok_pr:
+                print(f"[OK] после вычитки: body={len(body_pr)} znakov")
+                return title_pr, body_pr, img_pr
+            else:
+                print(f"[PROOFREAD FAILED] {reason_pr}, используем оригинал")
+                print(f"[OK] после генерации: body={len(body)} znakov")
+                return title, body, img
+
         except Exception as e:
             print(f"[ERROR] attempt {attempt}: {e}")
             time.sleep(2)
