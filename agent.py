@@ -5,6 +5,7 @@ import time
 import html
 import random
 import re
+import unicodedata
 import requests
 import psycopg2
 from urllib.parse import quote
@@ -18,7 +19,7 @@ _raw_channel = os.environ["CHANNEL_ID"]
 TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_channel)
 LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 
-CANDIDATES_PER_DAY = 3
+CANDIDATES_PER_DAY = 5
 MAX_RETRIES = 4
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
@@ -56,54 +57,48 @@ TOPICS = [
     "Стивен Хокинг: человек, победивший время",
     "Эйнштейн и его ошибки: где гений промахнулся",
     "Размер Вселенной: где заканчивается космос",
+    "Время и гравитация: почему у поверхности Земли время идёт медленнее",
+    "Путешествия во времени: что говорит физика",
+    "Волны пространства-времени: гравитационные волны",
+    "Антиматерия: где она во Вселенной",
+    "Реликтовое излучение: эхо Большого взрыва",
+    "Гравитационное линзирование: как работают космические лупы",
+    "Чандрасекаровский предел: почему звёзды умирают",
+    "Квазары: самые яркие объекты Вселенной",
+    "Тёмные века Вселенной: что было после Большого взрыва",
+    "Эффект Унру: как ускорение рождает частицы",
 ]
 
 
-# --- Разрешённые символы ---
-def _build_allowed_set():
-    allowed = set()
-    # Кириллица
-    for c in range(0x0400, 0x0500):
-        allowed.add(chr(c))
-    # Латиница (для терминов WIMP, NASA и т.п.)
-    for c in range(ord('a'), ord('z') + 1):
-        allowed.add(chr(c))
-    for c in range(ord('A'), ord('Z') + 1):
-        allowed.add(chr(c))
-    # Цифры
-    for c in range(ord('0'), ord('9') + 1):
-        allowed.add(chr(c))
-    # Пунктуация и пробелы
-    for ch in " \t\n\r.,!?;:—–-\"'«»""''()[]/\\*#@&%+=<>§|~^$°":
-        allowed.add(ch)
-    # Эмодзи (основные диапазоны)
-    for start, end in [
-        (0x2600, 0x27BF),     # Misc symbols & dingbats
-        (0x2B00, 0x2BFF),     # Misc symbols and arrows
-        (0x1F000, 0x1FAFF),   # Основной эмодзи-блок
-    ]:
-        for c in range(start, end + 1):
-            allowed.add(chr(c))
-    # Спец-символы для эмодзи
-    allowed.add('\u200d')   # ZWJ
-    allowed.add('\uFE0F')   # Variation selector
-    return allowed
-
-
-ALLOWED_CHARS = _build_allowed_set()
+def is_allowed_char(ch):
+    if ch in "\n\r\t ":
+        return True
+    cat = unicodedata.category(ch)
+    if cat in ('Lu', 'Ll'):
+        code = ord(ch)
+        if 0x0400 <= code <= 0x04FF:
+            return True
+        if 0x0041 <= code <= 0x005A:
+            return True
+        if 0x0061 <= code <= 0x007A:
+            return True
+        return False
+    if cat == 'Nd':
+        return True
+    if cat[0] in ('P', 'S'):
+        return True
+    if cat in ('Mn', 'Mc', 'Me', 'Cf'):
+        return True
+    if cat == 'Zs':
+        return True
+    return False
 
 
 def find_bad_chars(text):
-    """Возвращает список недопустимых символов (корейский, арабский, иероглифы и т.п.)"""
-    bad = []
-    for ch in text:
-        if ch not in ALLOWED_CHARS:
-            bad.append(ch)
-    return bad
+    return [ch for ch in text if not is_allowed_char(ch)]
 
 
 def find_mixed_scripts(text):
-    """Находит слова, где смешаны кириллица и латиница."""
     bad = []
     for word in re.findall(r"[А-Яа-яЁёA-Za-z]+", text):
         has_cyr = any("\u0400" <= c <= "\u04FF" for c in word)
@@ -176,7 +171,7 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
-def call_llm(prompt, temperature=0.9, max_tokens=2200):
+def call_llm(prompt, temperature=0.9, max_tokens=3000):
     r = requests.post(
         "https://openrouter.ai/api/v1/chat/completions",
         headers={
@@ -218,41 +213,61 @@ def parse_json(text):
         raise ValueError(f"no JSON object: {text[:200]}")
     candidate = text[start:end + 1]
     try:
-        return json.loads(candidate)
+        result = json.loads(candidate)
     except json.JSONDecodeError:
         cleaned = re.sub(r",\s*([}\]])", r"\1", candidate)
-        return json.loads(cleaned)
+        result = json.loads(cleaned)
+
+    if isinstance(result, dict) and len(result) == 1:
+        only_val = list(result.values())[0]
+        if isinstance(only_val, dict) and "title" in only_val and "body" in only_val:
+            return only_val
+    if isinstance(result, dict):
+        for v in result.values():
+            if isinstance(v, dict) and "title" in v and "body" in v:
+                return v
+    return result
 
 
 WRITER_PROMPT = """Напиши пост для Telegram-канала о космосе на тему: {topic}
 
-Ответ — только JSON-объект с тремя полями title, body, image_prompt. Без пояснений и без markdown.
+ВАЖНО: начни свой ответ ровно с символа {{ и не пиши никаких размышлений, пояснений или преамбул. Только JSON.
+
+Формат JSON:
+{{"title": "...", "body": "...", "image_prompt": "..."}}
 
 title — заголовок, 5-9 слов, цепляющий.
 body — текст поста на русском, 1500-2000 знаков. 3-4 абзаца с пустыми строками между ними. 3-5 эмодзи. В конце хештеги #космос #время #физика.
-image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды. Без людей и животных.
+image_prompt — английский промпт для картинки, 12-18 слов. Космос: чёрные дыры, галактики, туманности, звёзды.
 
 КРИТИЧНО:
-- Пиши только на русском языке кириллицей. Не используй буквы других алфавитов.
-- Не смешивай кириллицу и латиницу в одном слове.
-- Английские термины (WIMP, NASA) — только отдельными словами латиницей.
-- Проверь текст на орфографию перед отправкой.
+- Только кириллица в русских словах. Не смешивай с латиницей.
+- Английские термины (WIMP, NASA) — отдельными словами.
+- Проверь орфографию.
 """
 
-PROOFREAD_PROMPT = """Проверь следующий JSON для Telegram-поста и исправь ошибки.
+PROOFREAD_PROMPT = """Ты — корректор. Получаешь JSON с полями title, body, image_prompt для Telegram-поста о космосе.
 
-Входной JSON:
+Вход:
 {json_text}
 
-Правила:
-- Исправь орфографические, грамматические, пунктуационные и фактические ошибки.
-- Исправь неправильные термины (например, СМБ → СМВ, АЛС → БАС, «Частицовый» → «Частичный»).
-- Убери любые символы не русского алфавита, кроме цифр, эмодзи и общепринятых аббревиатур латиницей (WIMP, NASA и т.п.).
-- Сохрани смысл, стиль, длину (1500-2000 знаков) и эмодзи.
-- Не добавляй пояснений и markdown.
-- Если ошибок нет — верни JSON без изменений.
+Задача: верни исправленный JSON с теми же полями.
 
-Верни только исправленный JSON в том же формате:
+Что исправить:
+- Орфографические, грамматические, пунктуационные ошибки.
+- Фактические ошибки в терминах (СМБ→СМВ, АЛС→БАС, «частицовый»→«частичный», «замерлите»→«замрёте»).
+- Смешение алфавитов в словах (реlict→реликтовый).
+- Посторонние символы (корейские, японские) — удалить или заменить русскими.
+- Если body короче 1400 знаков — расширь до 1500-2000, сохранив смысл.
+
+Не меняй:
+- image_prompt (только если там ошибки английского).
+- Общий смысл и стиль.
+- Хештеги в конце.
+
+ВАЖНО: начни ответ ровно с {{ и не пиши размышлений.
+
+Формат:
 {{"title": "...", "body": "...", "image_prompt": "..."}}
 """
 
@@ -261,7 +276,7 @@ def validate(title, body, img):
     if not title or not body or not img:
         return False, "пустые поля"
     blen = len(body.strip())
-    if blen < 1000:
+    if blen < 1200:
         return False, f"body короткий ({blen})"
     if blen > 3000:
         return False, f"body длинный ({blen})"
@@ -286,22 +301,24 @@ def validate(title, body, img):
 
 
 def proofread(title, body, img):
-    """Второй проход через LLM для вычитки. Возвращает исправленные поля."""
     payload = {"title": title, "body": body, "image_prompt": img}
     json_text = json.dumps(payload, ensure_ascii=False)
-    try:
-        raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text),
-                       temperature=0.2, max_tokens=2200)
-        p = parse_json(raw)
-        title2 = (p.get("title") or "").strip()
-        body2 = (p.get("body") or "").strip()
-        img2 = (p.get("image_prompt") or "").strip()
-        if not (title2 and body2 and img2):
-            return title, body, img
-        return title2, body2, img2
-    except Exception as e:
-        print(f"[PROOFREAD ERROR] {e}")
-        return title, body, img
+
+    for attempt in (1, 2):
+        try:
+            raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text),
+                           temperature=0.2, max_tokens=3000)
+            p = parse_json(raw)
+            title2 = (p.get("title") or "").strip()
+            body2 = (p.get("body") or "").strip()
+            img2 = (p.get("image_prompt") or "").strip()
+            if not (title2 and body2 and img2):
+                continue
+            return title2, body2, img2, True
+        except Exception as e:
+            print(f"[PROOFREAD ERROR] попытка {attempt}: {e}")
+            time.sleep(1)
+    return title, body, img, False
 
 
 def generate_one(topic):
@@ -321,19 +338,20 @@ def generate_one(topic):
                 time.sleep(2)
                 continue
 
-            # Второй проход — вычитка
-            print(f"[PROOFREAD] attempt {attempt}: исправляем ошибки...")
-            title_pr, body_pr, img_pr = proofread(title, body, img)
+            print(f"[GENERATED] attempt {attempt}: body={len(body)} znakov")
+            title_pr, body_pr, img_pr, applied = proofread(title, body, img)
 
-            # Валидируем результат вычитки
-            ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
-            if ok_pr:
-                print(f"[OK] после вычитки: body={len(body_pr)} znakov")
-                return title_pr, body_pr, img_pr
+            if applied:
+                ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
+                if ok_pr:
+                    print(f"[OK] после вычитки: body={len(body_pr)} znakov")
+                    return title_pr, body_pr, img_pr
+                else:
+                    print(f"[PROOFREAD REJECTED] {reason_pr} — берём оригинал")
             else:
-                print(f"[PROOFREAD FAILED] {reason_pr}, используем оригинал")
-                print(f"[OK] после генерации: body={len(body)} znakov")
-                return title, body, img
+                print("[PROOFREAD SKIPPED] берём оригинал")
+
+            return title, body, img
 
         except Exception as e:
             print(f"[ERROR] attempt {attempt}: {e}")
@@ -360,11 +378,13 @@ def task_write():
     print(f"[MODEL] {LLM_MODEL}")
 
     created = []
+    failed_topics = []
     for i, topic in enumerate(selected_topics, 1):
         print(f"--- Generating {i}/{CANDIDATES_PER_DAY}: {topic} ---")
         result = generate_one(topic)
         if not result:
             print(f"[FAILED] не удалось сгенерировать пост {i}")
+            failed_topics.append(topic)
             continue
 
         title, body, img = result
@@ -396,7 +416,12 @@ def task_write():
             print(f"[SEND ERROR] {idx}: {e}")
 
     topics_str = " · ".join(t[:40] for t in [c[4] for c in created])
-    send_tg(TG_ADMIN_ID, f"📌 Темы дня: <b>{esc(topics_str)}</b>")
+    send_tg(TG_ADMIN_ID, f"📌 Темы дня ({len(created)}): <b>{esc(topics_str)}</b>")
+
+    if failed_topics:
+        failed_str = " · ".join(t[:40] for t in failed_topics)
+        send_tg(TG_ADMIN_ID,
+                f"⚠️ Не удалось сгенерировать {len(failed_topics)} тем:\n<i>{esc(failed_str)}</i>")
 
 
 def task_publish():
