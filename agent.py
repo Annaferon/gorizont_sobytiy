@@ -22,6 +22,11 @@ FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen/qwen-2.5-72b-instruct:fr
 
 CANDIDATES_PER_DAY = 5
 MAX_RETRIES = 3
+
+# Защита от двойного запуска в течение часа (ретраи GitHub и т.п.)
+# Расписание публикаций задаётся в .github/workflows/agents.yml
+SAFETY_MIN_INTERVAL_MINUTES = 60
+
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
 
 STYLE_MODIFIERS = [
@@ -537,11 +542,9 @@ def task_write():
                 f"⚠️ Не удалось сгенерировать {len(failed_topics)} тем:\n<i>{esc(failed_str)}</i>")
 
 
-def _publish_one(cur, bot_id, title, body, image_prompt, source_label):
-    """Публикует один пост в канал. Возвращает True при успехе."""
-    channel_id = TG_CHANNEL_ID
+def _publish_one(title, body, image_prompt, source_label):
     try:
-        send_photo_then_text(channel_id, image_prompt, title, body)
+        send_photo_then_text(TG_CHANNEL_ID, image_prompt, title, body)
         print(f"[PUBLISH] отправлен ({source_label}): {title}")
         return True
     except Exception as e:
@@ -553,7 +556,6 @@ def task_publish():
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # 1. Проверяем флаг публикации
     cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
     row = cur.fetchone()
     enabled = row and row["value"] == "true"
@@ -563,23 +565,23 @@ def task_publish():
         conn.close()
         return
 
-    # 2. Лимит: одна публикация в 20 часов
-    cur.execute("""SELECT 1 FROM publish_queue
-                   WHERE published_at > NOW() - INTERVAL '20 hours' LIMIT 1""")
+    # Защита от случайного двойного запуска в течение часа
+    cur.execute(f"""SELECT 1 FROM publish_queue
+                    WHERE published_at > NOW() - INTERVAL '{SAFETY_MIN_INTERVAL_MINUTES} minutes'
+                    LIMIT 1""")
     if cur.fetchone():
-        print("Недавно уже был пост — ждём")
+        print(f"Пост публиковался менее {SAFETY_MIN_INTERVAL_MINUTES} мин назад — ждём")
         cur.close()
         conn.close()
         return
 
-    # 3. Пробуем взять из очереди
+    # Сначала берём из очереди (то, что ты нажал ✅)
     cur.execute("""SELECT * FROM publish_queue WHERE published_at IS NULL
                    ORDER BY position NULLS LAST, id LIMIT 1""")
     d = cur.fetchone()
 
     if d:
-        # Публикуем из очереди (то, что ты одобрил кнопкой ✅)
-        if _publish_one(cur, d["id"], d["title"], d["content"], d["image_prompt"], "queue"):
+        if _publish_one(d["title"], d["content"], d["image_prompt"], "queue"):
             cur.execute("UPDATE publish_queue SET published_at=NOW() WHERE id=%s", (d["id"],))
             conn.commit()
             print(f"Опубликован из очереди #{d['id']}: {d['title']}")
@@ -587,7 +589,7 @@ def task_publish():
         conn.close()
         return
 
-    # 4. Очередь пуста — берём СЛУЧАЙНЫЙ пост из банка (saved)
+    # Очередь пуста — берём случайный из банка
     cur.execute("""SELECT * FROM ai_drafts
                    WHERE status='saved'
                    ORDER BY RANDOM() LIMIT 1""")
@@ -599,13 +601,10 @@ def task_publish():
         conn.close()
         return
 
-    # Публикуем из банка
-    if _publish_one(cur, saved["id"], saved["title"], saved["content"],
-                    saved["image_prompt"], "bank"):
-        # 4.1. Помечаем пост как опубликованный — чтобы больше НЕ попадал в выборку
+    if _publish_one(saved["title"], saved["content"], saved["image_prompt"], "bank"):
         cur.execute("UPDATE ai_drafts SET status='published' WHERE id=%s", (saved["id"],))
-        # 4.2. Записываем в publish_queue как sent — чтобы 20-часовой лимит сработал
-        cur.execute("""INSERT INTO publish_queue (title, content, image_prompt, source, published_at, position)
+        cur.execute("""INSERT INTO publish_queue
+                       (title, content, image_prompt, source, published_at, position)
                        VALUES (%s, %s, %s, 'bank', NOW(),
                                (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
                     (saved["title"], saved["content"], saved["image_prompt"]))
@@ -627,6 +626,9 @@ def task_stats():
     saved = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='published'")
     published = cur.fetchone()["c"]
+    cur.execute("""SELECT COUNT(*) AS c FROM publish_queue
+                   WHERE published_at > NOW() - INTERVAL '24 hours'""")
+    last24h = cur.fetchone()["c"]
     cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
     row = cur.fetchone()
     enabled = row["value"] if row else "true"
@@ -635,7 +637,14 @@ def task_stats():
            f"Черновиков на проверке: {pending}\n"
            f"Сохранённых в банке: {saved}\n"
            f"Опубликовано всего: {published}\n"
-           f"Публикация: <b>{enabled}</b>")
+           f"За последние 24 ч: {last24h}\n"
+           f"Публикация: <b>{enabled}</b>\n\n"
+           f"📅 Расписание (МСК):\n"
+           f"04:00 — генерация 5 постов\n"
+           f"08:00 — обработка нажатий\n"
+           f"10:00 — публикация №1\n"
+           f"15:00 — публикация №2\n"
+           f"21:00 — сводка")
     send_tg(TG_ADMIN_ID, msg)
     cur.close()
     conn.close()
