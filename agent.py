@@ -71,9 +71,7 @@ TOPICS = [
 ]
 
 
-# ---- Расширенная автозамена ----
 AUTO_FIXES = [
-    # Аббревиатуры и термины
     (r"\bСЗИ\b", "СМВ"),
     (r"\bСМБ\b", "СМВ"),
     (r"\bАЛС\b", "БАС"),
@@ -89,10 +87,8 @@ AUTO_FIXES = [
     (r"\bНаш наблюдаемый Вселенная\b", "Наша наблюдаемая Вселенная"),
     (r"\bнамеками\b", "намёками"),
     (r"\bНамеками\b", "Намёками"),
-    # Новые ошибки из последнего прогона
     (r"\bгуголь\b", "гугол"),
     (r"\bГуголь\b", "Гугол"),
-    (r"\bгуголь\b", "гугол"),
     (r"термодинамическ\w+ стрелок", "термодинамическая стрела"),
     (r"термодинамическ\w+ стрелк\w+", "термодинамическая стрела"),
     (r"газировк\w+ хронологии", "защита хронологии"),
@@ -115,7 +111,7 @@ def auto_fix(text):
     for pattern, repl in AUTO_FIXES:
         text = re.sub(pattern, repl, text)
     if text != original:
-        print(f"[AUTO-FIX] применены автозамены")
+        print("[AUTO-FIX] применены автозамены")
     return text
 
 
@@ -171,9 +167,7 @@ SUSPICIOUS_PATTERNS = [
     (r"Наш наблюдаемый Вселенная", "согласование рода"),
     (r"намеками", "намёками — потеряна ё"),
     (r"гуголь", "гуголь вместо гугол"),
-    (r"гуголь", "гуголь вместо гугол"),
     (r"термодинамическ\w+ стрелок", "стрелок вместо стрела"),
-    (r"термодинамическ\w+ стрелк", "стрелка вместо стрела"),
     (r"газировк\w+ хронологии", "газировка вместо защита"),
     (r"космоческ", "космоческого вместо космического"),
     (r"генеральн\w+ теори", "генеральная вместо Общая"),
@@ -254,7 +248,6 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
 
 def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=True):
     target_model = model or LLM_MODEL
-
     messages = [{"role": "user", "content": prompt}]
     if use_prefill:
         messages.append({"role": "assistant", "content": '{"title": "'})
@@ -350,9 +343,7 @@ PROOFREAD_PROMPT = """Ты — строгий корректор русског�
 2. Термины:
    - СЗИ/СМБ → СМВ (реликтовое излучение)
    - АЛС → БАС (боковой амиотрофический склероз)
-   - «частицовый» → «частичный»
-   - «замерлите» → «замрёте»
-   - «пузырёвый» → «пузырьковый»
+   - «частицовый» → «частичный», «замерлите» → «замрёте», «пузырёвый» → «пузырьковый»
    - «гуголь» → «гугол»
    - «термодинамический стрелок» → «термодинамическая стрела времени»
    - «газировка хронологии» → «защита хронологии»
@@ -360,8 +351,8 @@ PROOFREAD_PROMPT = """Ты — строгий корректор русског�
    - «генеральная теория относительности» → «Общая теория относительности»
 3. Орфография: ставь ё (намёками, звёзды, замёрз, звёздную).
 4. Смешение алфавитов: «реlict» → «реликтовый».
-5. Естественный порядок слов — если фраза звучит как машинный перевод, перестрой.
-6. Длина body 1500-2000 знаков: если короче — расширь, если длиннее — сократи.
+5. Естественный порядок слов.
+6. Длина body 1500-2000 знаков.
 
 НЕ меняй: image_prompt (если там нет ошибок), смысл, хештеги.
 
@@ -400,14 +391,14 @@ def validate(title, body, img):
 def proofread(title, body, img, model=None):
     payload = {"title": title, "body": body, "image_prompt": img}
     json_text = json.dumps(payload, ensure_ascii=False)
-
     current = (title, body, img)
+
     for attempt in (1, 2):
         try:
             suspicious = find_suspicious(current[0] + " " + current[1])
             extra_note = ""
             if suspicious:
-                extra_note = "ОСОБОЕ ВНИМАНИЕ (найдены автоматически): " + "; ".join(suspicious)
+                extra_note = "ОСОБОЕ ВНИМАНИЕ: " + "; ".join(suspicious)
 
             raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text, extra_note=extra_note),
                            temperature=0.2, max_tokens=3000,
@@ -546,10 +537,23 @@ def task_write():
                 f"⚠️ Не удалось сгенерировать {len(failed_topics)} тем:\n<i>{esc(failed_str)}</i>")
 
 
+def _publish_one(cur, bot_id, title, body, image_prompt, source_label):
+    """Публикует один пост в канал. Возвращает True при успехе."""
+    channel_id = TG_CHANNEL_ID
+    try:
+        send_photo_then_text(channel_id, image_prompt, title, body)
+        print(f"[PUBLISH] отправлен ({source_label}): {title}")
+        return True
+    except Exception as e:
+        print(f"[PUBLISH ERROR] {source_label}: {e}")
+        return False
+
+
 def task_publish():
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
+    # 1. Проверяем флаг публикации
     cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
     row = cur.fetchone()
     enabled = row and row["value"] == "true"
@@ -559,35 +563,55 @@ def task_publish():
         conn.close()
         return
 
+    # 2. Лимит: одна публикация в 20 часов
     cur.execute("""SELECT 1 FROM publish_queue
                    WHERE published_at > NOW() - INTERVAL '20 hours' LIMIT 1""")
     if cur.fetchone():
-        print("Недавно уже был пост")
+        print("Недавно уже был пост — ждём")
         cur.close()
         conn.close()
         return
 
+    # 3. Пробуем взять из очереди
     cur.execute("""SELECT * FROM publish_queue WHERE published_at IS NULL
                    ORDER BY position NULLS LAST, id LIMIT 1""")
     d = cur.fetchone()
-    if not d:
-        print("Очередь пуста")
+
+    if d:
+        # Публикуем из очереди (то, что ты одобрил кнопкой ✅)
+        if _publish_one(cur, d["id"], d["title"], d["content"], d["image_prompt"], "queue"):
+            cur.execute("UPDATE publish_queue SET published_at=NOW() WHERE id=%s", (d["id"],))
+            conn.commit()
+            print(f"Опубликован из очереди #{d['id']}: {d['title']}")
         cur.close()
         conn.close()
         return
 
-    img_prompt = d["image_prompt"] or "cosmic deep space nebula stars"
-    try:
-        send_photo_then_text(TG_CHANNEL_ID, img_prompt, d["title"], d["content"])
-    except Exception as e:
-        print(f"Publish error: {e}")
+    # 4. Очередь пуста — берём СЛУЧАЙНЫЙ пост из банка (saved)
+    cur.execute("""SELECT * FROM ai_drafts
+                   WHERE status='saved'
+                   ORDER BY RANDOM() LIMIT 1""")
+    saved = cur.fetchone()
+
+    if not saved:
+        print("Очередь пуста и банк пуст — публиковать нечего")
         cur.close()
         conn.close()
         return
 
-    cur.execute("UPDATE publish_queue SET published_at=NOW() WHERE id=%s", (d["id"],))
-    conn.commit()
-    print(f"Опубликован #{d['id']}: {d['title']}")
+    # Публикуем из банка
+    if _publish_one(cur, saved["id"], saved["title"], saved["content"],
+                    saved["image_prompt"], "bank"):
+        # 4.1. Помечаем пост как опубликованный — чтобы больше НЕ попадал в выборку
+        cur.execute("UPDATE ai_drafts SET status='published' WHERE id=%s", (saved["id"],))
+        # 4.2. Записываем в publish_queue как sent — чтобы 20-часовой лимит сработал
+        cur.execute("""INSERT INTO publish_queue (title, content, image_prompt, source, published_at, position)
+                       VALUES (%s, %s, %s, 'bank', NOW(),
+                               (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
+                    (saved["title"], saved["content"], saved["image_prompt"]))
+        conn.commit()
+        print(f"Опубликован из банка #{saved['id']}: {saved['title']}")
+
     cur.close()
     conn.close()
 
@@ -601,6 +625,8 @@ def task_stats():
     pending = cur.fetchone()["c"]
     cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='saved'")
     saved = cur.fetchone()["c"]
+    cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='published'")
+    published = cur.fetchone()["c"]
     cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
     row = cur.fetchone()
     enabled = row["value"] if row else "true"
@@ -608,6 +634,7 @@ def task_stats():
            f"В очереди на публикацию: {queue}\n"
            f"Черновиков на проверке: {pending}\n"
            f"Сохранённых в банке: {saved}\n"
+           f"Опубликовано всего: {published}\n"
            f"Публикация: <b>{enabled}</b>")
     send_tg(TG_ADMIN_ID, msg)
     cur.close()
