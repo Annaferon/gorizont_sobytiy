@@ -6,6 +6,7 @@ import html
 import random
 import re
 import unicodedata
+import traceback
 import requests
 import psycopg2
 from urllib.parse import quote
@@ -18,15 +19,11 @@ TG_ADMIN_ID = int(os.environ["ADMIN_ID"])
 _raw_channel = os.environ["CHANNEL_ID"]
 TG_CHANNEL_ID = _raw_channel if _raw_channel.startswith("@") else int(_raw_channel)
 LLM_MODEL = os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "qwen/qwen-2.5-72b-instruct:free")
+FALLBACK_MODEL = os.environ.get("FALLBACK_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
 
 CANDIDATES_PER_DAY = 5
 MAX_RETRIES = 3
-
-# Автоудаление старых pending-черновиков (часов)
-PENDING_TTL_HOURS = 48
-
-# Защита от двойного запуска публикации в течение часа
+PENDING_TTL_HOURS = 24
 SAFETY_MIN_INTERVAL_MINUTES = 60
 
 TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
@@ -146,6 +143,14 @@ def is_allowed_char(ch):
     return False
 
 
+def sanitize_str(text):
+    if not text:
+        return text
+    cleaned = ''.join(ch for ch in text if is_allowed_char(ch))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
 def find_bad_chars(text):
     return [ch for ch in text if not is_allowed_char(ch)]
 
@@ -195,11 +200,23 @@ def db():
 
 
 def tg(method, **kwargs):
-    r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=30)
-    data = r.json()
-    if not data.get("ok"):
-        print(f"[TG ERROR] {method}: {data}")
-    return data
+    """Запрос к Telegram API. Не бросает исключений, только возвращает dict."""
+    try:
+        r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=30)
+        data = r.json()
+        if not data.get("ok"):
+            desc = data.get("description", "")
+            # Подавляем шумные не-критичные ошибки
+            if "query is too old" in desc or "response timeout expired" in desc:
+                print(f"[TG] {method}: пропущено (query is too old)")
+            elif "message is not modified" in desc:
+                print(f"[TG] {method}: пропущено (message is not modified)")
+            else:
+                print(f"[TG ERROR] {method}: {data}")
+        return data
+    except Exception as e:
+        print(f"[TG EXCEPTION] {method}: {e}")
+        return {"ok": False, "description": str(e)}
 
 
 def esc(text):
@@ -333,7 +350,7 @@ image_prompt — английский промпт для картинки, 12-1
 - «реликтовое излучение» или «СМВ» (НЕ «СМБ», «СЗИ»)
 - «боковой амиотрофический склероз» или «БАС» (НЕ «АЛС»)
 
-Пиши только кириллицей, без латиницы в русских словах. Проверь орфографию.
+Пиши только кириллицей, без латиницы в русских словах. Не используй странные фонетические символы (ı, ɔ, ɛ и подобные). Только обычные русские буквы. Проверь орфографию.
 """
 
 
@@ -358,8 +375,9 @@ PROOFREAD_PROMPT = """Ты — строгий корректор русског�
    - «генеральная теория относительности» → «Общая теория относительности»
 3. Орфография: ставь ё (намёками, звёзды, замёрз, звёздную).
 4. Смешение алфавитов: «реlict» → «реликтовый».
-5. Естественный порядок слов.
-6. Длина body 1500-2000 знаков.
+5. Странные фонетические символы (ı, ɔ, ɛ) → замени обычными русскими буквами или удали.
+6. Естественный порядок слов.
+7. Длина body 1500-2000 знаков.
 
 НЕ меняй: image_prompt (если там нет ошибок), смысл, хештеги.
 
@@ -409,7 +427,7 @@ def proofread(title, body, img, model=None):
 
             raw = call_llm(PROOFREAD_PROMPT.format(json_text=json_text, extra_note=extra_note),
                            temperature=0.2, max_tokens=3000,
-                           model=model, use_prefill=False)
+                           model=model, use_prefill=True)
             p = parse_json(raw)
             t2 = (p.get("title") or "").strip()
             b2 = (p.get("body") or "").strip()
@@ -444,6 +462,8 @@ def try_generate(topic, model, use_prefill, attempts):
 
             title = auto_fix(title)
             body = auto_fix(body)
+            title = sanitize_str(title)
+            body = sanitize_str(body)
 
             ok, reason = validate(title, body, img)
             if not ok:
@@ -471,6 +491,8 @@ def generate_one(topic):
     title_pr, body_pr, img_pr, applied = proofread(title, body, img)
     body_pr = auto_fix(body_pr)
     title_pr = auto_fix(title_pr)
+    body_pr = sanitize_str(body_pr)
+    title_pr = sanitize_str(title_pr)
     ok_pr, reason_pr = validate(title_pr, body_pr, img_pr)
     if ok_pr:
         print(f"[OK] после вычитки: body={len(body_pr)}")
@@ -480,7 +502,6 @@ def generate_one(topic):
 
 
 def cleanup_old_pending(cur):
-    """Удаляет pending-посты старше PENDING_TTL_HOURS часов."""
     cur.execute(f"""DELETE FROM ai_drafts
                     WHERE status='pending'
                     AND created_at < NOW() - INTERVAL '{PENDING_TTL_HOURS} hours'
@@ -495,11 +516,9 @@ def task_write():
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    # Шаг 1: чистим старые pending (>48 часов), чтобы база не забивалась
     cleanup_old_pending(cur)
     conn.commit()
 
-    # Шаг 2: генерируем 5 свежих постов (блокировки по свежим pending больше НЕТ)
     selected_topics = random.sample(TOPICS, CANDIDATES_PER_DAY)
     print(f"[TOPICS] {selected_topics}")
     print(f"[MODEL] {LLM_MODEL}")
@@ -509,7 +528,13 @@ def task_write():
     failed_topics = []
     for i, topic in enumerate(selected_topics, 1):
         print(f"--- Generating {i}/{CANDIDATES_PER_DAY}: {topic} ---")
-        result = generate_one(topic)
+        try:
+            result = generate_one(topic)
+        except Exception as e:
+            print(f"[GEN FATAL] {type(e).__name__}: {e}")
+            traceback.print_exc()
+            result = None
+
         if not result:
             print(f"[FAILED] не удалось сгенерировать пост {i}")
             failed_topics.append(topic)
@@ -526,7 +551,10 @@ def task_write():
             print(f"[OK] draft #{did}: {title}")
         except psycopg2.errors.UniqueViolation:
             conn.rollback()
-            print(f"[SKIP] дубликат (hash уже есть в базе)")
+            print(f"[SKIP] дубликат hash")
+        except Exception as e:
+            conn.rollback()
+            print(f"[DB ERROR] {type(e).__name__}: {e}")
 
     cur.close()
     conn.close()
@@ -548,12 +576,18 @@ def task_write():
             print(f"[SEND ERROR] {idx}: {e}")
 
     topics_str = " · ".join(t[:40] for t in [c[4] for c in created])
-    send_tg(TG_ADMIN_ID, f"📌 Новые посты ({len(created)}): <b>{esc(topics_str)}</b>")
+    try:
+        send_tg(TG_ADMIN_ID, f"📌 Новые посты ({len(created)}): <b>{esc(topics_str)}</b>")
+    except Exception as e:
+        print(f"[SEND TOPICS ERROR] {e}")
 
     if failed_topics:
         failed_str = " · ".join(t[:40] for t in failed_topics)
-        send_tg(TG_ADMIN_ID,
-                f"⚠️ Не удалось сгенерировать {len(failed_topics)} тем:\n<i>{esc(failed_str)}</i>")
+        try:
+            send_tg(TG_ADMIN_ID,
+                    f"⚠️ Не удалось сгенерировать {len(failed_topics)} тем:\n<i>{esc(failed_str)}</i>")
+        except Exception as e:
+            print(f"[SEND FAILED ERROR] {e}")
 
 
 def _publish_one(title, body, image_prompt, source_label):
@@ -649,85 +683,160 @@ def task_stats():
            f"Сохранённых в банке: {saved}\n"
            f"Опубликовано всего: {published}\n"
            f"За последние 24 ч: {last24h}\n"
-           f"Публикация: <b>{enabled}</b>\n\n"
-           f"📅 Расписание (МСК):\n"
-           f"04:00 — генерация 5 постов\n"
-           f"каждые 2 ч — обработка нажатий\n"
-           f"10:00 — публикация №1\n"
-           f"15:00 — публикация №2\n"
-           f"21:00 — сводка")
+           f"Публикация: <b>{enabled}</b>")
     send_tg(TG_ADMIN_ID, msg)
     cur.close()
     conn.close()
 
 
+def ensure_webhook_removed():
+    try:
+        r = requests.get(f"{TG_API}/getWebhookInfo", timeout=15).json()
+        if not r.get("ok"):
+            print(f"[WEBHOOK CHECK] ошибка API: {r}")
+            return
+        info = r.get("result", {})
+        url = info.get("url") or ""
+        pending = info.get("pending_update_count", 0)
+        print(f"[WEBHOOK INFO] url='{url}', pending_updates={pending}")
+        if url:
+            print(f"[WEBHOOK] найден активный webhook, удаляю...")
+            res = requests.get(f"{TG_API}/deleteWebhook?drop_pending_updates=false", timeout=15).json()
+            print(f"[WEBHOOK] результат удаления: {res}")
+    except Exception as e:
+        print(f"[WEBHOOK CHECK ERROR] {e}")
+
+
+def _fetch_all_updates(initial_offset):
+    """Забирает все доступные апдейты. Если их много — делает несколько запросов."""
+    all_updates = []
+    offset = initial_offset
+    for iteration in range(5):
+        try:
+            r = requests.get(f"{TG_API}/getUpdates",
+                             params={"offset": offset, "timeout": 2, "limit": 100},
+                             timeout=30).json()
+        except Exception as e:
+            print(f"[GETUPDATES EXCEPTION] {e}")
+            break
+
+        print(f"[GETUPDATES #{iteration+1}] ok={r.get('ok')}, кол-во={len(r.get('result', []))}")
+
+        if not r.get("ok"):
+            print(f"[GETUPDATES ERROR] {r}")
+            break
+
+        batch = r.get("result", [])
+        if not batch:
+            break
+
+        all_updates.extend(batch)
+        # Обновляем offset: next batch начинается с последнего + 1
+        offset = batch[-1]["update_id"] + 1
+
+    return all_updates
+
+
+def _process_single_update(cur, u, admin_id):
+    """Обрабатывает один callback. Не бросает исключений наружу."""
+    cb = u.get("callback_query")
+    if not cb:
+        return None  # не callback, игнорируем
+
+    data = cb.get("data", "")
+    cb_id = cb.get("id")
+    msg = cb.get("message") or {}
+    msg_id = msg.get("message_id")
+    chat_id = (msg.get("chat") or {}).get("id")
+    from_id = (cb.get("from") or {}).get("id")
+
+    print(f"[CALLBACK] data='{data}', from={from_id}, chat={chat_id}, msg={msg_id}")
+
+    if from_id != admin_id:
+        if cb_id:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="Не для тебя")
+        return "skip"
+
+    if ":" not in data:
+        return "skip"
+
+    try:
+        action, did = data.split(":", 1)
+        did = int(did)
+    except Exception as e:
+        print(f"[CALLBACK] не разобрал data: {e}")
+        return "skip"
+
+    cur.execute("SELECT * FROM ai_drafts WHERE id=%s", (did,))
+    d = cur.fetchone()
+    if not d:
+        print(f"[CALLBACK] черновик #{did} не найден")
+        if cb_id:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="Черновик не найден")
+        return "skip"
+
+    if action == "ok":
+        cur.execute("""INSERT INTO publish_queue (title, content, image_prompt, source, position)
+                       VALUES (%s, %s, %s, 'ai',
+                       (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
+                    (d["title"], d["content"], d["image_prompt"]))
+        cur.execute("UPDATE ai_drafts SET status='approved' WHERE id=%s", (did,))
+        new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n✅ <i>В очереди на публикацию</i>"
+        if cb_id:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="✅ В очередь")
+    elif action == "save":
+        cur.execute("UPDATE ai_drafts SET status='saved' WHERE id=%s", (did,))
+        new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n📁 <i>Сохранено в банк</i>"
+        if cb_id:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="📁 Сохранено")
+    elif action == "no":
+        cur.execute("UPDATE ai_drafts SET status='rejected', rejected_at=NOW() WHERE id=%s", (did,))
+        new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n❌ <i>Удалено</i>"
+        if cb_id:
+            tg("answerCallbackQuery", callback_query_id=cb_id, text="❌ Удалено")
+    else:
+        return "skip"
+
+    if msg_id and chat_id:
+        tg("editMessageText", chat_id=chat_id, message_id=msg_id,
+           text=new_text, parse_mode="HTML", disable_web_page_preview=True)
+    return "ok"
+
+
 def task_callbacks():
+    ensure_webhook_removed()
+
     conn = db()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT value FROM bot_state WHERE key='tg_offset'")
     row = cur.fetchone()
     offset = int(row["value"]) if row else 0
+    print(f"[OFFSET] текущий offset из базы: {offset}")
 
-    r = requests.get(f"{TG_API}/getUpdates",
-                     params={"offset": offset, "timeout": 0}, timeout=30).json()
-    if not r.get("ok"):
-        print(f"getUpdates error: {r}")
-        cur.close()
-        conn.close()
-        return
+    if offset > 100_000_000_000:
+        print(f"[OFFSET] подозрительно большой, сбрасываю в 0")
+        offset = 0
 
-    updates = r.get("result", [])
+    all_updates = _fetch_all_updates(offset)
+    print(f"[TOTAL] забрано апдейтов: {len(all_updates)}")
+
     max_id = offset - 1
     processed = 0
+    errors = 0
 
-    for u in updates:
-        max_id = max(max_id, u["update_id"])
-        cb = u.get("callback_query")
-        if not cb:
-            continue
-        data = cb.get("data", "")
-        cb_id = cb["id"]
-        msg_id = cb["message"]["message_id"]
-
+    for u in all_updates:
         try:
-            action, did = data.split(":", 1)
-            did = int(did)
-        except Exception:
-            continue
-
-        cur.execute("SELECT * FROM ai_drafts WHERE id=%s", (did,))
-        d = cur.fetchone()
-        if not d:
-            tg("answerCallbackQuery", callback_query_id=cb_id, text="Черновик не найден")
-            continue
-
-        if action == "ok":
-            cur.execute("""INSERT INTO publish_queue (title, content, image_prompt, source, position)
-                           VALUES (%s, %s, %s, 'ai',
-                           (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
-                        (d["title"], d["content"], d["image_prompt"]))
-            cur.execute("UPDATE ai_drafts SET status='approved' WHERE id=%s", (did,))
-            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n✅ <i>В очереди на публикацию</i>"
-            tg("answerCallbackQuery", callback_query_id=cb_id, text="✅ В очередь")
-        elif action == "save":
-            cur.execute("UPDATE ai_drafts SET status='saved' WHERE id=%s", (did,))
-            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n📁 <i>Сохранено в банк</i>"
-            tg("answerCallbackQuery", callback_query_id=cb_id, text="📁 Сохранено")
-        elif action == "no":
-            cur.execute("UPDATE ai_drafts SET status='rejected', rejected_at=NOW() WHERE id=%s", (did,))
-            new_text = f"<b>{esc(d['title'])}</b>\n\n{esc(d['content'])}\n\n❌ <i>Удалено</i>"
-            tg("answerCallbackQuery", callback_query_id=cb_id, text="❌ Удалено")
-        else:
-            continue
-
-        conn.commit()
-        try:
-            tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
-               message_id=msg_id, text=new_text, parse_mode="HTML",
-               disable_web_page_preview=True)
+            max_id = max(max_id, u["update_id"])
+            result = _process_single_update(cur, u, TG_ADMIN_ID)
+            if result == "ok":
+                conn.commit()
+                processed += 1
         except Exception as e:
-            print(f"edit error: {e}")
-        processed += 1
+            errors += 1
+            conn.rollback()
+            print(f"[CALLBACK ERROR] update_id={u.get('update_id')}: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            # всё равно продолжаем обработку остальных апдейтов
 
     cur.execute("""INSERT INTO bot_state (key, value) VALUES ('tg_offset', %s)
                    ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
@@ -735,7 +844,7 @@ def task_callbacks():
     conn.commit()
     cur.close()
     conn.close()
-    print(f"Обработано: {processed}, offset={max_id+1}")
+    print(f"[DONE] Обработано: {processed}, ошибок: {errors}, новый offset={max_id+1}")
 
 
 if __name__ == "__main__":
@@ -743,16 +852,21 @@ if __name__ == "__main__":
         print("Usage: python agent.py [write|publish|stats|callbacks|all]")
         sys.exit(1)
     t = sys.argv[1]
-    if t == "write":
-        task_write()
-    elif t == "publish":
-        task_publish()
-    elif t == "stats":
-        task_stats()
-    elif t == "callbacks":
-        task_callbacks()
-    elif t == "all":
-        task_callbacks()
-        task_publish()
-    else:
-        print(f"Unknown: {t}")
+    try:
+        if t == "write":
+            task_write()
+        elif t == "publish":
+            task_publish()
+        elif t == "stats":
+            task_stats()
+        elif t == "callbacks":
+            task_callbacks()
+        elif t == "all":
+            task_callbacks()
+            task_publish()
+        else:
+            print(f"Unknown: {t}")
+    except Exception as e:
+        print(f"[FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        sys.exit(1)
