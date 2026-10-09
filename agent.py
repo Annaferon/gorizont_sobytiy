@@ -195,18 +195,52 @@ def find_suspicious(text):
     return found
 
 
+# ==========================================================================
+# БЕЗОПАСНОЕ ПОДКЛЮЧЕНИЕ К БД
+# ==========================================================================
 def db():
+    """Открывает новое соединение с Neon."""
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 
+def safe_rollback(conn):
+    """Rollback, который не падает, если соединение уже закрыто."""
+    try:
+        conn.rollback()
+    except Exception:
+        pass
+
+
+def safe_close(conn):
+    """Закрывает соединение, не падая на ошибках."""
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def db_retry(func, retries=3, delay=3):
+    """Обёртка для операций с БД: если соединение упало — переподключаемся и пробуем снова."""
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            return func()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            last_error = e
+            print(f"[DB RETRY] попытка {attempt} не удалась: {e}")
+            time.sleep(delay)
+    raise last_error
+
+
+# ==========================================================================
+# TELEGRAM
+# ==========================================================================
 def tg(method, **kwargs):
-    """Запрос к Telegram API. Не бросает исключений, только возвращает dict."""
     try:
         r = requests.post(f"{TG_API}/{method}", json=kwargs, timeout=30)
         data = r.json()
         if not data.get("ok"):
             desc = data.get("description", "")
-            # Подавляем шумные не-критичные ошибки
             if "query is too old" in desc or "response timeout expired" in desc:
                 print(f"[TG] {method}: пропущено (query is too old)")
             elif "message is not modified" in desc:
@@ -270,6 +304,9 @@ def send_photo_then_text(chat_id, image_prompt, title, body, reply_markup=None):
     return send_tg(chat_id, text, reply_markup=reply_markup)
 
 
+# ==========================================================================
+# LLM
+# ==========================================================================
 def call_llm(prompt, temperature=0.9, max_tokens=3000, model=None, use_prefill=True):
     target_model = model or LLM_MODEL
     messages = [{"role": "user", "content": prompt}]
@@ -363,10 +400,10 @@ PROOFREAD_PROMPT = """Ты — строгий корректор русског�
 {extra_note}
 
 ОБЯЗАТЕЛЬНЫЙ ЧЕК-ЛИСТ:
-1. Согласование рода/числа/падежа: «наш наблюдаемый Вселенная» → «наша наблюдаемая Вселенная», «Оккама бритвой» → «бритвы Оккама».
+1. Согласование рода/числа/падежа.
 2. Термины:
-   - СЗИ/СМБ → СМВ (реликтовое излучение)
-   - АЛС → БАС (боковой амиотрофический склероз)
+   - СЗИ/СМБ → СМВ
+   - АЛС → БАС
    - «частицовый» → «частичный», «замерлите» → «замрёте», «пузырёвый» → «пузырьковый»
    - «гуголь» → «гугол»
    - «термодинамический стрелок» → «термодинамическая стрела времени»
@@ -375,13 +412,13 @@ PROOFREAD_PROMPT = """Ты — строгий корректор русског�
    - «генеральная теория относительности» → «Общая теория относительности»
 3. Орфография: ставь ё (намёками, звёзды, замёрз, звёздную).
 4. Смешение алфавитов: «реlict» → «реликтовый».
-5. Странные фонетические символы (ı, ɔ, ɛ) → замени обычными русскими буквами или удали.
+5. Странные фонетические символы (ı, ɔ, ɛ) → замени обычными русскими.
 6. Естественный порядок слов.
 7. Длина body 1500-2000 знаков.
 
 НЕ меняй: image_prompt (если там нет ошибок), смысл, хештеги.
 
-Верни JSON с теми же тремя полями: title, body, image_prompt.
+Верни JSON с теми же тремя полями.
 """
 
 
@@ -501,30 +538,80 @@ def generate_one(topic):
     return title, body, img
 
 
-def cleanup_old_pending(cur):
-    cur.execute(f"""DELETE FROM ai_drafts
-                    WHERE status='pending'
-                    AND created_at < NOW() - INTERVAL '{PENDING_TTL_HOURS} hours'
-                    RETURNING id""")
-    deleted = cur.fetchall()
-    if deleted:
-        print(f"[CLEANUP] удалено {len(deleted)} старых pending (>{PENDING_TTL_HOURS}ч)")
-    return len(deleted)
+# ==========================================================================
+# ЗАПИСЬ (короткая сессия БД)
+# ==========================================================================
+def cleanup_old_pending():
+    def _run():
+        conn = db()
+        cur = conn.cursor()
+        cur.execute(f"""DELETE FROM ai_drafts
+                        WHERE status='pending'
+                        AND created_at < NOW() - INTERVAL '{PENDING_TTL_HOURS} hours'
+                        RETURNING id""")
+        deleted = cur.fetchall()
+        conn.commit()
+        cur.close()
+        safe_close(conn)
+        return len(deleted)
+    try:
+        n = db_retry(_run)
+        if n:
+            print(f"[CLEANUP] удалено {n} старых pending (>{PENDING_TTL_HOURS}ч)")
+    except Exception as e:
+        print(f"[CLEANUP ERROR] {e}")
 
 
+def save_posts_to_db(items):
+    """Сохраняет посты пачкой. Возвращает список (id, title, body, img, topic)."""
+    if not items:
+        return []
+
+    def _run():
+        conn = db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        saved = []
+        for topic, title, body, img in items:
+            try:
+                cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
+                               VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
+                            (topic, title, body, img))
+                did = cur.fetchone()["id"]
+                conn.commit()
+                saved.append((did, title, body, img, topic))
+                print(f"[SAVED] draft #{did}: {title}")
+            except psycopg2.errors.UniqueViolation:
+                safe_rollback(conn)
+                print(f"[SKIP] дубликат hash")
+            except Exception as e:
+                safe_rollback(conn)
+                print(f"[DB ERROR] {type(e).__name__}: {e}")
+        cur.close()
+        safe_close(conn)
+        return saved
+
+    try:
+        return db_retry(_run, retries=2, delay=5)
+    except Exception as e:
+        print(f"[SAVE FATAL] {type(e).__name__}: {e}")
+        traceback.print_exc()
+        return []
+
+
+# ==========================================================================
+# ЗАДАЧИ
+# ==========================================================================
 def task_write():
-    conn = db()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    # 1. Чистим старое
+    cleanup_old_pending()
 
-    cleanup_old_pending(cur)
-    conn.commit()
-
+    # 2. Генерируем всё в память (долгая часть, БД не нужна)
     selected_topics = random.sample(TOPICS, CANDIDATES_PER_DAY)
     print(f"[TOPICS] {selected_topics}")
     print(f"[MODEL] {LLM_MODEL}")
     print(f"[FALLBACK] {FALLBACK_MODEL}")
 
-    created = []
+    generated = []
     failed_topics = []
     for i, topic in enumerate(selected_topics, 1):
         print(f"--- Generating {i}/{CANDIDATES_PER_DAY}: {topic} ---")
@@ -541,28 +628,21 @@ def task_write():
             continue
 
         title, body, img = result
-        try:
-            cur.execute("""INSERT INTO ai_drafts (topic, title, content, image_prompt, status)
-                           VALUES (%s, %s, %s, %s, 'pending') RETURNING id""",
-                        (topic, title, body, img))
-            did = cur.fetchone()["id"]
-            conn.commit()
-            created.append((did, title, body, img, topic))
-            print(f"[OK] draft #{did}: {title}")
-        except psycopg2.errors.UniqueViolation:
-            conn.rollback()
-            print(f"[SKIP] дубликат hash")
-        except Exception as e:
-            conn.rollback()
-            print(f"[DB ERROR] {type(e).__name__}: {e}")
+        generated.append((topic, title, body, img))
 
-    cur.close()
-    conn.close()
-
-    if not created:
+    if not generated:
         send_tg(TG_ADMIN_ID, "⚠️ Writer ничего не сгенерил. Проверь лог.")
         return
 
+    # 3. Пишем всё в БД пачкой (короткая часть, ~2-3 секунды)
+    print(f"[DB WRITE] сохраняю {len(generated)} постов...")
+    created = save_posts_to_db(generated)
+
+    if not created:
+        send_tg(TG_ADMIN_ID, "⚠️ Не удалось сохранить посты в БД. Проверь лог.")
+        return
+
+    # 4. Отправляем админу
     for idx, (did, title, body, img, topic) in enumerate(created, 1):
         kb = {"inline_keyboard": [[
             {"text": "✅ Опубликовать", "callback_data": f"ok:{did}"},
@@ -601,82 +681,118 @@ def _publish_one(title, body, image_prompt, source_label):
 
 
 def task_publish():
-    conn = db()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    def _check_and_get():
+        conn = db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
 
-    cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
-    row = cur.fetchone()
-    enabled = row and row["value"] == "true"
-    if not enabled:
+        cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
+        row = cur.fetchone()
+        enabled = row and row["value"] == "true"
+        if not enabled:
+            cur.close(); safe_close(conn)
+            return ("disabled", None)
+
+        cur.execute(f"""SELECT 1 FROM publish_queue
+                        WHERE published_at > NOW() - INTERVAL '{SAFETY_MIN_INTERVAL_MINUTES} minutes'
+                        LIMIT 1""")
+        if cur.fetchone():
+            cur.close(); safe_close(conn)
+            return ("too_soon", None)
+
+        cur.execute("""SELECT * FROM publish_queue WHERE published_at IS NULL
+                       ORDER BY position NULLS LAST, id LIMIT 1""")
+        d = cur.fetchone()
+        if d:
+            cur.close(); safe_close(conn)
+            return ("from_queue", d)
+
+        cur.execute("""SELECT * FROM ai_drafts
+                       WHERE status='saved'
+                       ORDER BY RANDOM() LIMIT 1""")
+        saved = cur.fetchone()
+        cur.close(); safe_close(conn)
+        if not saved:
+            return ("empty", None)
+        return ("from_bank", saved)
+
+    try:
+        status, d = db_retry(_check_and_get)
+    except Exception as e:
+        print(f"[PUBLISH DB ERROR] {e}")
+        return
+
+    if status == "disabled":
         print("Публикация выключена")
-        cur.close()
-        conn.close()
         return
-
-    cur.execute(f"""SELECT 1 FROM publish_queue
-                    WHERE published_at > NOW() - INTERVAL '{SAFETY_MIN_INTERVAL_MINUTES} minutes'
-                    LIMIT 1""")
-    if cur.fetchone():
+    if status == "too_soon":
         print(f"Пост публиковался менее {SAFETY_MIN_INTERVAL_MINUTES} мин назад — ждём")
-        cur.close()
-        conn.close()
         return
-
-    cur.execute("""SELECT * FROM publish_queue WHERE published_at IS NULL
-                   ORDER BY position NULLS LAST, id LIMIT 1""")
-    d = cur.fetchone()
-
-    if d:
-        if _publish_one(d["title"], d["content"], d["image_prompt"], "queue"):
-            cur.execute("UPDATE publish_queue SET published_at=NOW() WHERE id=%s", (d["id"],))
-            conn.commit()
-            print(f"Опубликован из очереди #{d['id']}: {d['title']}")
-        cur.close()
-        conn.close()
-        return
-
-    cur.execute("""SELECT * FROM ai_drafts
-                   WHERE status='saved'
-                   ORDER BY RANDOM() LIMIT 1""")
-    saved = cur.fetchone()
-
-    if not saved:
+    if status == "empty":
         print("Очередь пуста и банк пуст — публиковать нечего")
-        cur.close()
-        conn.close()
         return
 
-    if _publish_one(saved["title"], saved["content"], saved["image_prompt"], "bank"):
-        cur.execute("UPDATE ai_drafts SET status='published' WHERE id=%s", (saved["id"],))
-        cur.execute("""INSERT INTO publish_queue
-                       (title, content, image_prompt, source, published_at, position)
-                       VALUES (%s, %s, %s, 'bank', NOW(),
-                               (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
-                    (saved["title"], saved["content"], saved["image_prompt"]))
-        conn.commit()
-        print(f"Опубликован из банка #{saved['id']}: {saved['title']}")
+    if status == "from_queue":
+        if _publish_one(d["title"], d["content"], d["image_prompt"], "queue"):
+            def _mark_sent():
+                conn = db()
+                cur = conn.cursor()
+                cur.execute("UPDATE publish_queue SET published_at=NOW() WHERE id=%s", (d["id"],))
+                conn.commit()
+                cur.close(); safe_close(conn)
+            try:
+                db_retry(_mark_sent)
+                print(f"Опубликован из очереди #{d['id']}: {d['title']}")
+            except Exception as e:
+                print(f"[MARK ERROR] {e}")
+        return
 
-    cur.close()
-    conn.close()
+    if status == "from_bank":
+        if _publish_one(d["title"], d["content"], d["image_prompt"], "bank"):
+            def _mark_bank_published():
+                conn = db()
+                cur = conn.cursor()
+                cur.execute("UPDATE ai_drafts SET status='published' WHERE id=%s", (d["id"],))
+                cur.execute("""INSERT INTO publish_queue
+                               (title, content, image_prompt, source, published_at, position)
+                               VALUES (%s, %s, %s, 'bank', NOW(),
+                                       (SELECT COALESCE(MAX(position), 0) + 1 FROM publish_queue))""",
+                            (d["title"], d["content"], d["image_prompt"]))
+                conn.commit()
+                cur.close(); safe_close(conn)
+            try:
+                db_retry(_mark_bank_published)
+                print(f"Опубликован из банка #{d['id']}: {d['title']}")
+            except Exception as e:
+                print(f"[MARK BANK ERROR] {e}")
 
 
 def task_stats():
-    conn = db()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT COUNT(*) AS c FROM publish_queue WHERE published_at IS NULL")
-    queue = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='pending'")
-    pending = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='saved'")
-    saved = cur.fetchone()["c"]
-    cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='published'")
-    published = cur.fetchone()["c"]
-    cur.execute("""SELECT COUNT(*) AS c FROM publish_queue
-                   WHERE published_at > NOW() - INTERVAL '24 hours'""")
-    last24h = cur.fetchone()["c"]
-    cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
-    row = cur.fetchone()
-    enabled = row["value"] if row else "true"
+    def _run():
+        conn = db()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT COUNT(*) AS c FROM publish_queue WHERE published_at IS NULL")
+        queue = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='pending'")
+        pending = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='saved'")
+        saved = cur.fetchone()["c"]
+        cur.execute("SELECT COUNT(*) AS c FROM ai_drafts WHERE status='published'")
+        published = cur.fetchone()["c"]
+        cur.execute("""SELECT COUNT(*) AS c FROM publish_queue
+                       WHERE published_at > NOW() - INTERVAL '24 hours'""")
+        last24h = cur.fetchone()["c"]
+        cur.execute("SELECT value FROM bot_state WHERE key='publishing_enabled'")
+        row = cur.fetchone()
+        enabled = row["value"] if row else "true"
+        cur.close(); safe_close(conn)
+        return queue, pending, saved, published, last24h, enabled
+
+    try:
+        queue, pending, saved, published, last24h, enabled = db_retry(_run)
+    except Exception as e:
+        print(f"[STATS ERROR] {e}")
+        return
+
     msg = (f"📊 <b>Статус «Горизонт событий»</b>\n\n"
            f"В очереди на публикацию: {queue}\n"
            f"Черновиков на проверке: {pending}\n"
@@ -685,8 +801,6 @@ def task_stats():
            f"За последние 24 ч: {last24h}\n"
            f"Публикация: <b>{enabled}</b>")
     send_tg(TG_ADMIN_ID, msg)
-    cur.close()
-    conn.close()
 
 
 def ensure_webhook_removed():
@@ -708,7 +822,6 @@ def ensure_webhook_removed():
 
 
 def _fetch_all_updates(initial_offset):
-    """Забирает все доступные апдейты. Если их много — делает несколько запросов."""
     all_updates = []
     offset = initial_offset
     for iteration in range(5):
@@ -731,17 +844,15 @@ def _fetch_all_updates(initial_offset):
             break
 
         all_updates.extend(batch)
-        # Обновляем offset: next batch начинается с последнего + 1
         offset = batch[-1]["update_id"] + 1
 
     return all_updates
 
 
 def _process_single_update(cur, u, admin_id):
-    """Обрабатывает один callback. Не бросает исключений наружу."""
     cb = u.get("callback_query")
     if not cb:
-        return None  # не callback, игнорируем
+        return None
 
     data = cb.get("data", "")
     cb_id = cb.get("id")
@@ -806,11 +917,20 @@ def _process_single_update(cur, u, admin_id):
 def task_callbacks():
     ensure_webhook_removed()
 
-    conn = db()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT value FROM bot_state WHERE key='tg_offset'")
-    row = cur.fetchone()
-    offset = int(row["value"]) if row else 0
+    # Получаем offset
+    try:
+        def _get_offset():
+            conn = db()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            cur.execute("SELECT value FROM bot_state WHERE key='tg_offset'")
+            row = cur.fetchone()
+            cur.close(); safe_close(conn)
+            return int(row["value"]) if row else 0
+        offset = db_retry(_get_offset)
+    except Exception as e:
+        print(f"[OFFSET ERROR] {e}, используем 0")
+        offset = 0
+
     print(f"[OFFSET] текущий offset из базы: {offset}")
 
     if offset > 100_000_000_000:
@@ -824,26 +944,41 @@ def task_callbacks():
     processed = 0
     errors = 0
 
-    for u in all_updates:
+    if all_updates:
         try:
-            max_id = max(max_id, u["update_id"])
-            result = _process_single_update(cur, u, TG_ADMIN_ID)
-            if result == "ok":
-                conn.commit()
-                processed += 1
+            conn = db()
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            for u in all_updates:
+                try:
+                    max_id = max(max_id, u["update_id"])
+                    result = _process_single_update(cur, u, TG_ADMIN_ID)
+                    if result == "ok":
+                        conn.commit()
+                        processed += 1
+                except Exception as e:
+                    errors += 1
+                    safe_rollback(conn)
+                    print(f"[CALLBACK ERROR] update_id={u.get('update_id')}: {type(e).__name__}: {e}")
+                    traceback.print_exc()
+            cur.close(); safe_close(conn)
         except Exception as e:
-            errors += 1
-            conn.rollback()
-            print(f"[CALLBACK ERROR] update_id={u.get('update_id')}: {type(e).__name__}: {e}")
+            print(f"[CALLBACKS DB ERROR] {type(e).__name__}: {e}")
             traceback.print_exc()
-            # всё равно продолжаем обработку остальных апдейтов
 
-    cur.execute("""INSERT INTO bot_state (key, value) VALUES ('tg_offset', %s)
-                   ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
-                (str(max_id + 1),))
-    conn.commit()
-    cur.close()
-    conn.close()
+    # Сохраняем новый offset
+    try:
+        def _set_offset():
+            conn = db()
+            cur = conn.cursor()
+            cur.execute("""INSERT INTO bot_state (key, value) VALUES ('tg_offset', %s)
+                           ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value""",
+                        (str(max_id + 1),))
+            conn.commit()
+            cur.close(); safe_close(conn)
+        db_retry(_set_offset)
+    except Exception as e:
+        print(f"[OFFSET SAVE ERROR] {e}")
+
     print(f"[DONE] Обработано: {processed}, ошибок: {errors}, новый offset={max_id+1}")
 
 
